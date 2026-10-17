@@ -1,0 +1,13 @@
+- insert:
+    - id: enderwriter
+      name: '@local/enderwriter'
+      config:
+        root: 'C:\Users\d2132\Documents\deepseek-harness\default-workspace\enderwriter'
+        python: 'C:\Users\d2132\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\python\python.exe'
+        defaultBudget: 800
+        # 总开关：false 时不注册任何工具与面板
+        enabled: true
+        # work 留空 = 每个对话一套独立记忆（默认）。
+        # 想让多个对话共享同一部作品的设定时，填作品名，例如：
+        #   work: '断魂崖'
+        work: ''
