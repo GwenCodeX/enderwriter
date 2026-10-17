@@ -1,0 +1,23 @@
+# 本地模型运行时（自动下载，不入版本库）
+vendor/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# 运行时产物
+*.db
+*.db-wal
+*.db-shm
+out/
+
+# 临时脚本
+_smoke*.py
+_bench*.py
+_probe*.py
+_get_*.py
+_patch*.py
+_diag*.py
+*.part
