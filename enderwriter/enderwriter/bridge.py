@@ -5,7 +5,7 @@
 
 用法::
 
-    python -m enderwriter.bridge '{"op":"search","entities":["沈砚"],"query":"月蚀"}'
+    python -m enderwriter.bridge '{"op":"search","entities":["张三"],"query":"月蚀"}'
     python -m enderwriter.bridge --op stats --db story.db
     get-content req.json | python -m enderwriter.bridge --stdin
 
@@ -324,6 +324,94 @@ def op_clear(args: dict[str, Any]) -> dict[str, Any]:
     )
 
 
+def op_forget_entry(args: dict[str, Any]) -> dict[str, Any]:
+    """删除单条记忆（按图层 + 实体名）。
+
+    与 op_clear 的区别：clear 删整库，这里只删一条词条。
+    删之前会把整库备份为 .bak-<时间戳>，所以误删可以恢复。
+
+    参数：
+      layer   图层（character/world/timeline/foreshadowing/item/style）
+      entity  实体名
+      work    可选；省略时按会话解析（全局库层 style 自动路由）
+    """
+    import shutil
+    import time
+
+    layer = str(args.get("layer") or "").strip()
+    entity = str(args.get("entity") or "").strip()
+    if not layer or not entity:
+        return _err("layer 与 entity 都必填", code="bad_request")
+
+    mem = _memory(args)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+
+    # style 层在全局库，其余在作品库
+    is_global_layer = layer == "style"
+    if is_global_layer:
+        path = mem.global_path
+        label = "全局文学库"
+    else:
+        if not mem.work_id:
+            return _err(
+                "删除作品库词条需要指定 work 或 session_id", code="bad_request"
+            )
+        path = mem.work_path
+        label = f"作品库「{mem.work_name}」"
+
+    if not os.path.isfile(path):
+        return _ok(
+            {
+                "removed": False,
+                "reason": "not_found",
+                "detail": f"{label} 不存在",
+                "layer": layer,
+                "entity": entity,
+            }
+        )
+
+    # 备份，保证可恢复
+    backup = f"{path}.bak-{stamp}"
+    try:
+        shutil.copy2(path, backup)
+    except OSError as exc:
+        return _err(f"备份失败，已中止删除：{exc}", code="backup_failed")
+
+    from .chest import EnderChest
+
+    chest = EnderChest(path)
+    try:
+        rec = chest.get(layer, entity)
+        if rec is None:
+            return _ok(
+                {
+                    "removed": False,
+                    "reason": "not_found",
+                    "detail": f"{label} 里没有「{entity}」",
+                    "layer": layer,
+                    "entity": entity,
+                    "backup": backup,
+                }
+            )
+        removed_version = rec.version
+        chest.delete(layer, entity)
+        remaining = chest.counts().get(layer, 0)
+    finally:
+        chest.close()
+
+    return _ok(
+        {
+            "removed": True,
+            "layer": layer,
+            "entity": entity,
+            "removed_version": removed_version,
+            "remaining_in_layer": remaining,
+            "backup": backup,
+            "scope": label,
+        }
+    )
+
+
 def op_overview(args: dict[str, Any]) -> dict[str, Any]:
     """面板用：两层记忆的完整概况 + 伏笔 + 统计。"""
     from .memory import SCOPE_GLOBAL, SCOPE_WORK, list_works
@@ -468,7 +556,7 @@ def op_search(args: dict[str, Any]) -> dict[str, Any]:
         entities = [x.strip() for x in entities.replace("，", ",").split(",") if x.strip()]
     entities = [str(e).strip() for e in entities if str(e).strip()]
     if not entities:
-        return _err("entities 不能为空：请至少给一个实体名（如 沈砚）", code="bad_request")
+        return _err("entities 不能为空：请至少给一个实体名（如 张三）", code="bad_request")
 
     req = {
         "entities": entities,
@@ -788,6 +876,7 @@ _OPS = {
     "works": op_works,
     "overview": op_overview,
     "clear": op_clear,
+    "forgetEntry": op_forget_entry,
     # 一致性检查
     "check": op_check,
 }
@@ -795,10 +884,15 @@ _OPS = {
 
 def handle(args: dict[str, Any]) -> dict[str, Any]:
     """分发一次请求。永不抛异常：错误一律转成 {ok:false,...}。"""
-    op = str(args.get("op") or "").strip().lower()
-    fn = _OPS.get(op)
+    raw = str(args.get("op") or "").strip()
+    # op 名大小写不敏感：forgetEntry / forgetentry 都能命中
+    fn = _OPS.get(raw) or _OPS.get(raw.lower())
     if fn is None:
-        return _err(f"未知 op：{op!r}；可选 {sorted(_OPS)}", code="unknown_op")
+        # 再按小写比较一遍所有注册项，兼容 camelCase 注册名
+        lowered = {k.lower(): v for k, v in _OPS.items()}
+        fn = lowered.get(raw.lower())
+    if fn is None:
+        return _err(f"未知 op：{raw!r}；可选 {sorted(_OPS)}", code="unknown_op")
     try:
         return fn(args)
     except FileNotFoundError as exc:
