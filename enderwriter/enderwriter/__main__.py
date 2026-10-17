@@ -4,7 +4,7 @@
 
     python -m enderwriter demo --window 8000 --llm stub
     python -m enderwriter stats --db ./demo.db
-    python -m enderwriter query -e 沈砚,断魂崖 -q "月蚀之夜" --budget 800
+    python -m enderwriter query -e 张三,示例卷 -q "月蚀之夜" --budget 800
     python -m enderwriter patrol --chapter ch_003
     python -m enderwriter export-schemas --out ./schemas
 """
