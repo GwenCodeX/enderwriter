@@ -1,0 +1,100 @@
+{
+  "type": "object",
+  "required": [
+    "high",
+    "medium",
+    "low",
+    "total_tokens"
+  ],
+  "additionalProperties": true,
+  "properties": {
+    "high": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/hit"
+      }
+    },
+    "medium": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/hit"
+      }
+    },
+    "low": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/hit"
+      }
+    },
+    "total_tokens": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "elapsed_ms": {
+      "type": "number"
+    },
+    "normalized": {
+      "type": "object"
+    },
+    "trace": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "definitions": {
+    "hit": {
+      "type": "object",
+      "required": [
+        "layer",
+        "entity",
+        "content",
+        "version",
+        "last_updated",
+        "confidence"
+      ],
+      "additionalProperties": true,
+      "properties": {
+        "layer": {
+          "enum": [
+            "character",
+            "world",
+            "timeline",
+            "foreshadowing",
+            "item",
+            "style"
+          ]
+        },
+        "entity": {
+          "type": "string"
+        },
+        "content": {
+          "type": "string"
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "last_updated": {
+          "type": "string"
+        },
+        "confidence": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "band": {
+          "enum": [
+            "high",
+            "medium",
+            "low"
+          ]
+        },
+        "in_context": {
+          "type": "boolean"
+        }
+      }
+    }
+  }
+}
