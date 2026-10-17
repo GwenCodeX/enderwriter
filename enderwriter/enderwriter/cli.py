@@ -140,7 +140,7 @@ def build_parser() -> argparse.ArgumentParser:
     # ---- query ----
     pq = sub.add_parser("query", help="检索记忆（search_memory）")
     pq.add_argument("--db", default=None, help="sqlite 路径（默认 :memory:）")
-    pq.add_argument("-e", "--entities", required=True, help="实体，逗号分隔，如 沈砚,断魂崖")
+    pq.add_argument("-e", "--entities", required=True, help="实体，逗号分隔，如 张三,示例卷")
     pq.add_argument("-q", "--query", default="", help="检索语境（自然语言）")
     pq.add_argument("--budget", type=int, default=800, help="token 预算（默认 800，上限规范 800）")
     pq.add_argument("--context", default="", help="已在上下文中的实体（逗号分隔），不重复返回正文")
