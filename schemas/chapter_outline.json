@@ -1,0 +1,121 @@
+{
+  "type": "object",
+  "required": [
+    "chapter_id",
+    "chapter_goal",
+    "active_characters",
+    "locations",
+    "items",
+    "foreshadowing_to_resolve",
+    "foreshadowing_to_plant",
+    "mood",
+    "style_keywords"
+  ],
+  "additionalProperties": true,
+  "properties": {
+    "chapter_id": {
+      "type": "string",
+      "pattern": "^ch_\\d+$"
+    },
+    "chapter_goal": {
+      "type": "string",
+      "minLength": 1
+    },
+    "active_characters": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "name",
+          "importance"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1
+          },
+          "importance": {
+            "enum": [
+              "core",
+              "secondary",
+              "minor"
+            ]
+          }
+        },
+        "additionalProperties": true
+      }
+    },
+    "locations": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "items": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "name",
+          "importance"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1
+          },
+          "importance": {
+            "enum": [
+              "core",
+              "secondary",
+              "minor"
+            ]
+          }
+        },
+        "additionalProperties": true
+      }
+    },
+    "foreshadowing_to_resolve": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "id"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^fs_[A-Za-z0-9_]+$"
+          }
+        },
+        "additionalProperties": true
+      }
+    },
+    "foreshadowing_to_plant": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "content"
+        ],
+        "properties": {
+          "content": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "additionalProperties": true
+      }
+    },
+    "mood": {
+      "type": "string"
+    },
+    "style_keywords": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  }
+}
