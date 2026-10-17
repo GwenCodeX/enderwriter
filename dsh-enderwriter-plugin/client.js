@@ -10,7 +10,7 @@
  * 通道由框架配对，不需要自己搭 HTTP 路由。
  */
 window.__ModuleLoader__.load({
-  id: '@local/enderwriter',
+  id: 'dsh-enderwriter',
   factory(require) {
     const React = require('react')
     // 动态 Client 半边的 React 未必导出全部 hook：缺什么就退化成朴素实现，
@@ -113,12 +113,17 @@ window.__ModuleLoader__.load({
 
       // 通道 2：Host 注册的同源只读路由（主通道）
       // 浏览器请求天然带 cookie，Host 侧会过连接层的信任检查。
+      const enc = (v) => encodeURIComponent(v == null ? '' : String(v))
       const qs =
         method === 'overview'
-          ? `?chapter=${encodeURIComponent(payload.chapter || '')}&work=${encodeURIComponent(payload.work || '')}`
+          ? `?chapter=${enc(payload.chapter)}&work=${enc(payload.work)}`
           : method === 'entries'
-            ? `?layer=${encodeURIComponent(payload.layer || 'character')}&work=${encodeURIComponent(payload.work || '')}`
-            : ''
+            ? `?layer=${enc(payload.layer || 'character')}&work=${enc(payload.work)}`
+            : method === 'clear'
+              ? `?target=${enc(payload.target)}&work=${enc(payload.work)}`
+              : method === 'forgetEntry'
+                ? `?layer=${enc(payload.layer)}&entity=${enc(payload.entity)}&work=${enc(payload.work)}`
+                : ''
       const url = `/api/enderwriter/${method}${qs}`
       let res
       try {
@@ -975,18 +980,35 @@ window.__ModuleLoader__.load({
       /**
        * 弹出清除确认。
        *
-       * 二次确认：弹层里必须勾选确认框才能点「确认删除」。
-       * 正文里说清楚**具体删什么、影响范围**，而不是笼统一句"不可撤销"。
+       * 二次确认：弹层里必须勾选确认框才能点「确认清除」。
+       *
+       * 注意 work 参数：必须用**当前正在浏览的作品**（viewingWork），
+       * 而不是写目标 workOverride。之前传错导致后端收到空 work，
+       * 直接返回"需要指定 work"，前端看起来就是"点了没反应"。
        */
-      function askClear(target, label) {
+      function askClear(target, label, scopeWork) {
         const scopeText =
           target === 'global'
             ? '将删除全局文学库里全部跨对话的写作经验。'
-            : target === 'all'
-              ? '将同时删除当前作品的记忆与全局文学库的全部经验。'
-              : '将删除该区块里的人物、世界、时间线、伏笔、物品等全部记录。'
+            : target === 'tech'
+              ? '将删除技术库里的全部工程笔记。'
+              : target === 'all'
+                ? '将同时删除当前作品的记忆与全局文学库的全部经验。'
+                : '将删除该区块里的人物、世界、时间线、伏笔、物品等全部记录。'
+
+        // 技术库与全局库不依赖 work；作品库必须带上
+        const needWork = target === 'work'
+        const workArg = scopeWork || (viewingWork && viewingWork.indexOf('__') !== 0 ? viewingWork : '')
+
+        if (needWork && !workArg) {
+          toast('无法确定要清除哪个作品', 'err')
+          return
+        }
 
         setConfirm({
+          // 必须显式 open:true，ConfirmDialog 用 props.open 判断是否渲染，
+          // 少了这个字段弹层永远不出现，表现出来就是"点了没反应"。
+          open: true,
           danger: true,
           armed: true,
           checked: false,
@@ -1004,14 +1026,62 @@ window.__ModuleLoader__.load({
           onConfirm: function () {
             setConfirm(null)
             setBusy('正在清除 ' + label + ' …')
-            callHost('clear', { target: target, work: workOverride || '' })
+            callHost('clear', { target: target, work: workArg })
               .then(function (res) {
                 const n = (res && res.ok_count) || 0
-                toast(n ? label + ' 已清除（' + n + ' 项）' : label + ' 本来是空的', 'ok')
-                load(chapter)
+                if (n > 0) toast(label + ' 已清除（' + n + ' 个库文件已备份）', 'ok')
+                else toast(label + ' 本来是空的', 'ok')
                 setEntries(null)
+                setSearch('')
+                load(chapter)
               })
-              .catch(function (e) { toast('清除失败：' + (e.message || e), 'err') })
+              .catch(function (e) {
+                toast('清除失败：' + (e && e.message ? e.message : e), 'err')
+              })
+              .then(function () { setBusy(null) })
+          },
+          onCancel: function () { setConfirm(null) },
+        })
+      }
+
+      /**
+       * 删除单条记忆。
+       *
+       * 词条是写作资产，所以同样走二次确认；
+       * 正文里带上词条名和内容摘要，避免删错。
+       */
+      function askDeleteEntry(layerName, entity, preview) {
+        setConfirm({
+          open: true,
+          danger: true,
+          armed: true,
+          checked: false,
+          title: '删除词条「' + entity + '」',
+          body:
+            '图层：' + layerName + '\n' +
+            (preview ? '内容：' + String(preview).slice(0, 120) + (String(preview).length > 120 ? '…' : '') + '\n\n' : '\n') +
+            '删除后该词条不再参与检索。会先备份整个库为 .bak 文件。',
+          confirmHint: '我已确认要删除「' + entity + '」',
+          confirmText: '确认删除',
+          onCheck: function (v) {
+            setConfirm(function (prev) {
+              return prev ? Object.assign({}, prev, { checked: !!v }) : prev
+            })
+          },
+          onConfirm: function () {
+            setConfirm(null)
+            setBusy('正在删除「' + entity + '」…')
+            callHost('forgetEntry', { layer: layerName, entity: entity, work: viewingWork })
+              .then(function (res) {
+                const removed = res && res.removed
+                if (removed) toast('已删除「' + entity + '」', 'ok')
+                else toast('没有找到「' + entity + '」，可能已被删除', 'err')
+                setEntries(null)
+                load(chapter)
+              })
+              .catch(function (e) {
+                toast('删除失败：' + (e && e.message ? e.message : e), 'err')
+              })
               .then(function () { setBusy(null) })
           },
           onCancel: function () { setConfirm(null) },
@@ -1212,19 +1282,31 @@ window.__ModuleLoader__.load({
                 : null),
             h('div', { className: open ? 'ew-row-body ew-body-full' : 'ew-row-body' },
               open || !long ? body : body.slice(0, 180) + '…'),
-            long
-              ? h('button', {
-                  className: 'ew-btn',
-                  style: { marginTop: 6, fontSize: 12, padding: '3px 10px' },
-                  onClick: function () {
-                    setExpanded(function (prev) {
-                      const next = Object.assign({}, prev)
-                      if (next[key]) delete next[key]
-                      else next[key] = true
-                      return next
-                    })
-                  },
-                }, open ? '收起' : '展开全文')
+            // 行内动作：展开 / 删除
+            (long || opts.onDelete)
+              ? h('div', { style: { display: 'flex', gap: 6, marginTop: 6 } },
+                  long
+                    ? h('button', {
+                        className: 'ew-btn',
+                        style: { fontSize: 12, padding: '3px 10px' },
+                        onClick: function () {
+                          setExpanded(function (prev) {
+                            const next = Object.assign({}, prev)
+                            if (next[key]) delete next[key]
+                            else next[key] = true
+                            return next
+                          })
+                        },
+                      }, open ? '收起' : '展开全文')
+                    : null,
+                  opts.onDelete
+                    ? h('button', {
+                        className: 'ew-btn is-danger',
+                        style: { fontSize: 12, padding: '3px 10px' },
+                        title: '删除这条记忆',
+                        onClick: opts.onDelete,
+                      }, '删除')
+                    : null)
               : null))
       }
 
@@ -1265,6 +1347,9 @@ window.__ModuleLoader__.load({
                         badge: 'v' + l.version,
                         name: l.entity,
                         body: l.content,
+                        onDelete: function () {
+                          askDeleteEntry('style', l.entity, l.content)
+                        },
                       })
                     }))
                   : (search.trim()
@@ -1301,6 +1386,9 @@ window.__ModuleLoader__.load({
                         badge: n.layer || 'style',
                         name: n.entity,
                         body: n.content,
+                        onDelete: function () {
+                          askDeleteEntry(n.layer || 'style', n.entity, n.content)
+                        },
                       })
                     }))
                   : (search.trim()
@@ -1328,6 +1416,9 @@ window.__ModuleLoader__.load({
                 name: it.entity,
                 meta: (it.chars || body.length) + ' 字' + (it.chapter_id ? ' · ' + it.chapter_id : ''),
                 body: body,
+                onDelete: function () {
+                  askDeleteEntry(layer, it.entity, body)
+                },
               })
             }))
           : (search.trim()
