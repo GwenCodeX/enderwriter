@@ -1,0 +1,38 @@
+{
+  "type": "object",
+  "required": [
+    "entities"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "entities": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "minItems": 1
+    },
+    "query_context": {
+      "type": "string"
+    },
+    "layers": {
+      "type": "array",
+      "items": {
+        "enum": [
+          "character",
+          "world",
+          "timeline",
+          "foreshadowing",
+          "item",
+          "style"
+        ]
+      }
+    },
+    "budget": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 8000
+    }
+  }
+}
