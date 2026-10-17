@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "enderwriter"
+version = "1.1.0"
+description = "末影写作：面向长篇小说的分层长时记忆系统"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "EnderWriter" }]
+keywords = ["novel", "writing", "memory", "llm", "long-form"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+]
+
+dependencies = []
+
+[project.optional-dependencies]
+vector = ["numpy>=1.24"]
+dev = ["pytest>=7"]
+
+[project.scripts]
+enderwriter = "enderwriter.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["enderwriter*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
