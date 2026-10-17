@@ -1,23 +1,43 @@
-# 本地模型运行时（自动下载，不入版本库）
+# 记忆数据（含个人写作内容，不入库）
+memory/
+*.db
+*.db.bak-*
+*.bak-*
+
+# 模型与推理引擎
 vendor/
+*.gguf
+*.ggml
+llama-*/
+ollama/
 
 # Python
 __pycache__/
 *.py[cod]
 *.egg-info/
+build/
+dist/
+.venv/
+venv/
 .pytest_cache/
 
-# 运行时产物
-*.db
-*.db-wal
-*.db-shm
-out/
+# Node
+node_modules/
+package-lock.json
+pnpm-lock.yaml
 
-# 临时脚本
-_smoke*.py
-_bench*.py
-_probe*.py
-_get_*.py
-_patch*.py
-_diag*.py
-*.part
+# 运行时诊断
+plugin-diag.json
+plugin-route.txt
+plugin-overview.json
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.log
+
+# 个人稿件
+*.txt
+!requirements*.txt
