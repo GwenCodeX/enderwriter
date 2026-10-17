@@ -213,7 +213,7 @@ def term_weights(text, *, entity="", title="") -> dict[str, float]:
 
 ```python
 def extract_entities(text: str, vocab) -> list[str]:
-    """从文本里找出已知实体。最长优先（避免"沈"先匹配掉"沈砚"），
+    """从文本里找出已知实体。最长优先（避免"沈"先匹配掉"张三"），
     命中后把该片段替换成空格防止重叠，最后按首次出现位置排序
     """
 ```
@@ -852,7 +852,7 @@ def _open_scoped(args, *, layer=None):
     """
 ```
 
-**这里曾经写成 `if work and not db`**，面板不传 `work` 时会掉进临时库分支并自动 `seed_demo()`——于是新对话"浏览条目"看到的是示例故事的沈砚/苏晚/裴照/陆无咎。现在所有读取类 op 都走 `_open_scoped`。
+**这里曾经写成 `if work and not db`**，面板不传 `work` 时会掉进临时库分支并自动 `seed_demo()`——于是新对话"浏览条目"看到的是示例故事的张三/李四/王五/赵六。现在所有读取类 op 都走 `_open_scoped`。
 
 ### 11.3 op 清单
 
