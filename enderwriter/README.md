@@ -14,7 +14,7 @@
 ## 快速开始
 
 ```powershell
-$py = 'C:\Users\d2132\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\python\python.exe'
+$py = '<本地路径>'
 cd <本目录>
 
 # 一、零依赖先跑通（离线 Stub，不需要任何模型）
