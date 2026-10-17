@@ -351,7 +351,7 @@ class StubBackend(LLMBackend):
         ranked = sorted(freq.items(), key=lambda kv: (-kv[1], kv[0]))
         out.extend(t for t, _ in ranked if freq[t] > 1)
         known = set(out) | set(self.vocabulary)
-        # 3) 组合词去重：若某词是更长已知词的子串（"断魂" ⊂ "断魂崖"），丢弃它
+        # 3) 组合词去重：若某词是更长已知词的子串（"断魂" ⊂ "示例卷"），丢弃它
         out = [
             t for t in out
             if not any(t != k and t in k for k in known)
@@ -610,7 +610,7 @@ class StubBackend(LLMBackend):
 
         约定标记（大小写不敏感）::
 
-            角色: 沈砚, 苏晚
+            角色: 张三, 李四
             地点: 归墟古战场
             物品: 断魂钉
             目标: 夺取残魂
