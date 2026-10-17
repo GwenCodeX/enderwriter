@@ -4,8 +4,8 @@
 如需新增能力，在自己的模块里实现。
 
 运行环境：
-- Python：`C:\Users\d2132\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\python\python.exe`
-- 包根：`C:\Users\d2132\Documents\deepseek-harness\default-workspace\enderwriter`
+- Python：`<本地路径>
+- 包根：`<EnderWriter 目录>`
 - 运行测试：`cd <包根>; & $py -m unittest discover -s tests`
 - 无 GPU / 无 Ollama / 无网络。numpy 是唯一第三方依赖。
 
