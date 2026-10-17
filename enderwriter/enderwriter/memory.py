@@ -118,7 +118,7 @@ def resolve_work(*, work: str | None = None, session_id: str | None = None) -> s
     """解析"这次该用哪个作品库"。
 
     优先级：
-      1. 显式给定的 ``work``（用户说"用作品《断魂崖》"）
+      1. 显式给定的 ``work``（用户说"用作品《示例卷》"）
       2. 当前会话专属作品（默认行为：按对话隔离）
       3. 空字符串（无会话时只用全局库）
     """
@@ -142,8 +142,25 @@ class WorkMemory:
 
     def __init__(self, work: str | None = None, *, home: str | None = None) -> None:
         self.home = os.path.abspath(home or default_home())
-        self.work_name = (work or "").strip()
-        self.work_id = slugify(self.work_name) if self.work_name else ""
+        name = (work or "").strip()
+
+        # 兼容传入"库 ID"（如 示例小说-5b512f）。
+        # 面板的作品列表同时给出 name 与 id，调用方可能传 id。
+        # 若直接 slugify(id) 会再追加一次哈希（示例小说-5b512f-97cc05），
+        # 拼出一个不存在的文件，导致所有操作静默失败。
+        raw_id = ""
+        if name:
+            if os.path.isfile(os.path.join(self.home, "works", f"{name}.db")):
+                raw_id = name
+            else:
+                for item in list_works(self.home):
+                    if item.get("id") == name and item.get("name"):
+                        name = item["name"]
+                        raw_id = item["id"]
+                        break
+
+        self.work_name = name
+        self.work_id = raw_id or (slugify(self.work_name) if self.work_name else "")
 
     # -- 路径 ----------------------------------------------------------
     @property
