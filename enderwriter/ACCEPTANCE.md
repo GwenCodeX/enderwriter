@@ -33,7 +33,7 @@ llama.cpp 与 Ollama 是同协议的等价方案，对上层完全透明——`O
 ① 规划   §3.1 九字段通过校验 → ch_003
 ② 检索   高相关 5 / 中相关 3，506 token
 ②b 组装  P0=376 P1=661 P2=594 P3=281 P4=128 = 2038 / 5600
-③ 生成  Qwen2.5-3B 实际写出 388 字正文（残灯/断魂钉/沈砚/苏晚设定全部一致）
+③ 生成  Qwen2.5-3B 实际写出 388 字正文（残灯/断魂钉/张三/李四设定全部一致）
 ④ 动态追加  识别 6 个新实体（照骨灯、归墟古战场、fs_002…）→ 追加 328 token
 ⑤ 回写   14 项落地，正文入库
 ⑥ 巡检   无超期/陈旧，无矛盾
@@ -114,7 +114,7 @@ llama.cpp 与 Ollama 是同协议的等价方案，对上层完全透明——`O
 | 图 | `edges` 表，1~N 跳 BFS，距离衰减 | 6 条边 |
 | 状态 | `state` 表，实体×键 → 当前值 + 所属章节 | 13 项 |
 
-**称呼格**实测生效：`沈师弟` → `沈砚`，`炎帝`/`岩枭` → `萧炎`。
+**称呼格**实测生效：`沈师弟` → `张三`，`炎帝`/`岩枭` → `萧炎`。
 
 **伏笔状态机**：`planted → reinforced → resolved / abandoned`，非法状态抛 `ValueError`。
 
@@ -210,7 +210,7 @@ OK
 ## 九、运行方式
 
 ```powershell
-$py = 'C:\Users\d2132\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\python\python.exe'
+$py = '<本地路径>'
 cd <仓库根>
 
 # 零依赖跑通（离线 Stub）
@@ -227,7 +227,7 @@ $env:EW_LLM = 'llamacpp'
 
 # 其他
 & $py -m enderwriter demo --db story.db    # 持久化
-& $py -m enderwriter query -e 沈师弟,断魂崖 -q 月蚀 --budget 300
+& $py -m enderwriter query -e 沈师弟,示例卷 -q 月蚀 --budget 300
 & $py -m enderwriter patrol --chapter ch_016
 & $py -m enderwriter stats
 & $py -m enderwriter export-schemas --out schemas
