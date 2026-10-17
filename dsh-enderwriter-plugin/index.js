@@ -79,18 +79,81 @@ function defaultPython() {
   const fromEnv = process.env.EW_PYTHON
   if (fromEnv && existsSync(fromEnv)) return fromEnv
 
+  const candidates = []
+
+  // 1) DSH_HOME 环境变量下的运行时（最理想）
   const dshHome = process.env.DSH_HOME
   if (dshHome) {
-    const candidates = [
+    candidates.push(
       join(dshHome, 'dsh-runtimes', 'dsh-primary-runtime', 'dependencies', 'python', 'python.exe'),
       join(dshHome, 'dsh-runtimes', 'dsh-primary-runtime', 'dependencies', 'python', 'bin', 'python3'),
-    ]
-    for (const p of candidates) {
-      if (existsSync(p)) return p
+    )
+  }
+
+  // 2) 用户目录下的 .dsh（DSH_HOME 常常没传进来，但目录一定在）
+  try {
+    const userHome = process.env.USERPROFILE || process.env.HOME || ''
+    if (userHome) {
+      candidates.push(
+        join(userHome, '.dsh', 'dsh-runtimes', 'dsh-primary-runtime', 'dependencies', 'python', 'python.exe'),
+        join(userHome, '.dsh', 'dsh-runtimes', 'dsh-primary-runtime', 'dependencies', 'python', 'bin', 'python3'),
+      )
+    }
+  } catch {
+    /* 忽略 */
+  }
+
+  // 3) 常见安装位置
+  if (process.platform === 'win32') {
+    const local = process.env.LOCALAPPDATA || ''
+    if (local) {
+      candidates.push(
+        join(local, 'Programs', 'Python', 'Python312', 'python.exe'),
+        join(local, 'Programs', 'Python', 'Python311', 'python.exe'),
+        join(local, 'Programs', 'Python', 'Python310', 'python.exe'),
+      )
+    }
+    candidates.push('C:\\Python312\\python.exe', 'C:\\Python311\\python.exe')
+  } else {
+    candidates.push('/usr/bin/python3', '/usr/local/bin/python3')
+  }
+
+  for (const p of candidates) {
+    try {
+      if (p && existsSync(p)) return p
+    } catch {
+      /* 忽略不可读 */
     }
   }
 
+  // 4) 最后才退回裸命令（依赖 PATH）
   return process.platform === 'win32' ? 'python.exe' : 'python3'
+}
+
+/** 把探测过程也记下来，便于排查为什么没找到解释器。 */
+function pythonCandidates() {
+  const out = []
+  const dshHome = process.env.DSH_HOME
+  const userHome = process.env.USERPROFILE || process.env.HOME || ''
+  out.push({ source: 'DSH_HOME', value: dshHome || null })
+  out.push({ source: 'USERPROFILE', value: userHome || null })
+  if (dshHome) {
+    out.push({
+      path: join(dshHome, 'dsh-runtimes', 'dsh-primary-runtime', 'dependencies', 'python', 'python.exe'),
+      exists: existsSync(
+        join(dshHome, 'dsh-runtimes', 'dsh-primary-runtime', 'dependencies', 'python', 'python.exe'),
+      ),
+    })
+  }
+  if (userHome) {
+    out.push({
+      path: join(userHome, '.dsh', 'dsh-runtimes', 'dsh-primary-runtime', 'dependencies', 'python', 'python.exe'),
+      exists: existsSync(
+        join(userHome, '.dsh', 'dsh-runtimes', 'dsh-primary-runtime', 'dependencies', 'python', 'python.exe'),
+      ),
+    })
+  }
+  return out
 }
 
 /** 默认 EnderWriter 包根：优先配置，其次与本插件同级/上级/在工作区内查找。 */
@@ -429,7 +492,7 @@ export function apply(ctx, config) {
             entities: {
               type: 'array',
               items: { type: 'string' },
-              description: '要查的实体名，如 ["沈砚","断魂钉"]；别名会自动解析为标准名',
+              description: '要查的实体名，如 ["张三","断魂钉"]；别名会自动解析为标准名',
             },
             query_context: {
               type: 'string',
@@ -847,6 +910,19 @@ export function apply(ctx, config) {
       JSON.stringify(
         {
           at: new Date().toISOString(),
+          // 关键：确认包根与解释器探测成功，否则数据会全空
+          root: root || null,
+          python: python || null,
+          home: home || null,
+          rootResolved: !!root,
+          pythonExists: (() => {
+            try {
+              return !!python && existsSync(python)
+            } catch {
+              return false
+            }
+          })(),
+          pythonProbe: pythonCandidates(),
           webServer: !!webServer,
           hasRegister: !!(webServer && typeof webServer.register === 'function'),
           connection: !!connection,
@@ -866,10 +942,15 @@ export function apply(ctx, config) {
     // work 为空时用 fixedWork（配置的作品），再由 Python 侧按会话解析；
     // 面板点选了具体作品时，这里必须把它传下去，否则永远显示默认作品。
     const target = (work || '').trim() || fixedWork
-    const [info, panel] = await Promise.all([
-      call('info', {}, 30000, sessionId),
-      call('overview', { work: target, chapter: chapter || '' }, 45000, sessionId),
-    ])
+
+    // panel 是面板的全部数据来源，失败要重试一次：
+    // 冷启动时 python 首次 spawn 较慢，容易在超时边缘失败。
+    let panel = await call('overview', { work: target, chapter: chapter || '' }, 60000, sessionId)
+    if (!panel.ok) {
+      panel = await call('overview', { work: target, chapter: chapter || '' }, 90000, sessionId)
+    }
+    const info = await call('info', {}, 30000, sessionId)
+
     return {
       info: info.ok ? info.data : null,
       panel: panel.ok ? panel.data : null,
@@ -911,6 +992,19 @@ export function apply(ctx, config) {
       }
       case 'clear': {
         const r = await call('clear', { ...args, work }, 60000, sid)
+        return r.ok ? { ok: true, value: r.data } : fail(r.message)
+      }
+      case 'forgetEntry': {
+        const r = await call(
+          'forgetEntry',
+          {
+            layer: args.layer,
+            entity: args.entity,
+            work: args.work || work,
+          },
+          60000,
+          sid,
+        )
         return r.ok ? { ok: true, value: r.data } : fail(r.message)
       }
       case 'works': {
@@ -1008,22 +1102,65 @@ export function apply(ctx, config) {
           }
 
           try {
-            const url = new URL(req.url ?? '/', 'http://localhost')
-            const sub = url.pathname.replace(/^\/api\/enderwriter\/?/, '')
+            const rawUrl = req.url ?? '/'
+            const qIdx = rawUrl.indexOf('?')
+            const rawPath = qIdx >= 0 ? rawUrl.slice(0, qIdx) : rawUrl
+            const rawQuery = qIdx >= 0 ? rawUrl.slice(qIdx + 1) : ''
+
+            // 手动解析查询串。中文作品名必须按 UTF-8 解码，
+            // new URL(...) 在这里拿到的是已解码过或编码不一致的字符串，
+            // 实测会把"示例卷"变成乱码，导致永远查不到指定作品。
+            const params = {}
+            for (const pair of rawQuery.split('&')) {
+              if (!pair) continue
+              const eq = pair.indexOf('=')
+              const k = eq >= 0 ? pair.slice(0, eq) : pair
+              const v = eq >= 0 ? pair.slice(eq + 1) : ''
+              const dec = (s) => {
+                try {
+                  return decodeURIComponent(s.replace(/\+/g, ' '))
+                } catch {
+                  return s
+                }
+              }
+              params[dec(k)] = dec(v)
+            }
+
+            const sub = rawPath.replace(/^\/api\/enderwriter\/?/, '')
             const sid = lastActiveSession || ''
             if (sub === 'overview' || sub === '') {
-              const value = await overview(
-                sid,
-                url.searchParams.get('chapter') || '',
-                url.searchParams.get('work') || '',
-              )
+              const value = await overview(sid, params.chapter || '', params.work || '')
+              // 诊断：确认 overview 到底返回了什么
+              try {
+                writeFileSync(
+                  join(root, 'memory', 'plugin-overview.json'),
+                  JSON.stringify(
+                    {
+                      at: new Date().toISOString(),
+                      sid,
+                      workParam: params.work || '',
+                      target: (params.work || '').trim() || fixedWork,
+                      infoOk: !!value.info,
+                      panelOk: !!value.panel,
+                      panelKeys: value.panel ? Object.keys(value.panel) : [],
+                      worksCount: (value.panel && value.panel.works && value.panel.works.length) || 0,
+                      errors: value.errors || [],
+                    },
+                    null,
+                    2,
+                  ),
+                  'utf8',
+                )
+              } catch {
+                /* 忽略 */
+              }
               send(200, { ok: true, ...value })
               return
             }
             if (sub === 'entries') {
               const r = await route('entries', {
-                layer: url.searchParams.get('layer') || 'character',
-                work: url.searchParams.get('work') || '',
+                layer: params.layer || 'character',
+                work: params.work || '',
                 sessionId: sid,
               })
               send(r.ok ? 200 : 500, r.ok ? { ok: true, ...r.value } : r)
@@ -1031,6 +1168,27 @@ export function apply(ctx, config) {
             }
             if (sub === 'works') {
               const r = await route('works', { sessionId: sid })
+              send(r.ok ? 200 : 500, r.ok ? { ok: true, ...r.value } : r)
+              return
+            }
+            if (sub === 'forgetEntry') {
+              // 写操作：参数从查询串取（面板用 GET 简化调用）
+              const r = await route('forgetEntry', {
+                layer: params.layer || '',
+                entity: params.entity || '',
+                work: params.work || '',
+                sessionId: sid,
+              })
+              send(r.ok ? 200 : 500, r.ok ? { ok: true, ...r.value } : r)
+              return
+            }
+            if (sub === 'clear') {
+              // 清除整库：真删库文件（会先备份），所以按钮必须走二次确认
+              const r = await route('clear', {
+                target: params.target || 'work',
+                work: params.work || '',
+                sessionId: sid,
+              })
               send(r.ok ? 200 : 500, r.ok ? { ok: true, ...r.value } : r)
               return
             }
