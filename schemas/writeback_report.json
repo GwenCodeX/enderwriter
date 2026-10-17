@@ -1,0 +1,102 @@
+{
+  "type": "object",
+  "required": [
+    "chapter_id",
+    "updated",
+    "warnings"
+  ],
+  "additionalProperties": true,
+  "properties": {
+    "chapter_id": {
+      "type": "string",
+      "pattern": "^ch_\\d+$"
+    },
+    "updated": {
+      "type": "object",
+      "required": [
+        "characters",
+        "items",
+        "timeline",
+        "foreshadowing"
+      ],
+      "properties": {
+        "characters": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "items": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "timeline": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "foreshadowing": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "id",
+              "status"
+            ],
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "status": {
+                "enum": [
+                  "planted",
+                  "reinforced",
+                  "resolved",
+                  "abandoned"
+                ]
+              },
+              "content": {
+                "type": "string"
+              }
+            },
+            "additionalProperties": true
+          }
+        },
+        "world": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "style": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": true
+    },
+    "warnings": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "patrol": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "created": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  }
+}
