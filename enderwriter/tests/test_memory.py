@@ -31,9 +31,19 @@ class TestRouting(unittest.TestCase):
         self.assertEqual(M.route("character", scope="bogus"), M.SCOPE_WORK)
 
     def test_layer_partition_is_complete(self):
+        """三个库的分区互斥且完整覆盖所有图层。"""
         from enderwriter.common import LAYERS
 
-        self.assertEqual(set(M.GLOBAL_LAYERS) | set(M.WORK_LAYERS), set(LAYERS))
+        g, w, t = set(M.GLOBAL_LAYERS), set(M.WORK_LAYERS), set(M.TECH_LAYERS)
+        self.assertEqual(g | w | t, set(LAYERS))
+        self.assertEqual(g & w, set())
+        self.assertEqual(g & t, set())
+        self.assertEqual(w & t, set())
+
+    def test_assertion_routes_to_tech(self):
+        self.assertEqual(M.route("assertion"), M.SCOPE_TECH)
+        self.assertEqual(M.route("style"), M.SCOPE_GLOBAL)
+        self.assertEqual(M.route("character"), M.SCOPE_WORK)
 
 
 class TestSlugify(unittest.TestCase):
