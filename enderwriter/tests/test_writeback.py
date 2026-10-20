@@ -580,7 +580,18 @@ class TestPatrolOrderingAndJson(unittest.TestCase):
         items = patrol(self.chest, 60)
         types = [i["type"] for i in items]
         self.assertEqual(types[0], "overdue")
-        self.assertEqual(types, sorted(types, key=lambda t: {"overdue": 0, "stale": 1, "unresolved": 2}[t]))
+        # unplanned 是后加的类别：开着但没定回收计划的伏笔会被报出来，
+        # 排最后（不紧急），但必须出现——否则巡检无法解释为什么算不出超期。
+        order = {"overdue": 0, "stale": 1, "unresolved": 2, "unplanned": 3}
+        self.assertEqual(types, sorted(types, key=lambda t: order[t]))
+
+    def test_unplanned_reported(self):
+        """没有 planned_resolve 的伏笔必须被报为 unplanned。"""
+        items = patrol(self.chest, 60)
+        unplanned = [i for i in items if i["type"] == "unplanned"]
+        # fs_001 与 fs_003 都没设 planned_resolve；fs_003 已 resolved 不算 open
+        self.assertIn("fs_001", [i["id"] for i in unplanned])
+        self.assertNotIn("fs_003", [i["id"] for i in unplanned])
 
     def test_json_serializable(self):
         items = patrol(self.chest, 60)
