@@ -46,6 +46,10 @@ LAYERS: tuple[str, ...] = (
     "foreshadowing",
     "item",
     "style",
+    # 断言格：把「事故复盘」转成「可机械判定的护栏」。
+    # 与 style 一样属于跨项目资产（默认进全局层），
+    # 但内容是 trigger + rule + fix，能被工具直接匹配代码。
+    "assertion",
 )
 
 LAYER_CN: dict[str, str] = {
@@ -55,6 +59,7 @@ LAYER_CN: dict[str, str] = {
     "foreshadowing": "伏笔格",
     "item": "物品格",
     "style": "风格格",
+    "assertion": "断言格",
     "alias": "称呼格",
 }
 
@@ -391,6 +396,10 @@ SCHEMAS: dict[str, dict] = {
                 "items": {"enum": list(LAYERS)},
             },
             "budget": {"type": "integer", "minimum": 1, "maximum": 8000},
+            # 按叙事位置检索：只看在这一章之前已经成立的设定。
+            # 长篇里同一条设定的内容会随剧情变化，写第 40 章时
+            # 不该拿到第 800 章才成立的结论。
+            "at_chapter": {"type": "string"},
         },
     },
     # 3.3 Memory Keeper 返回
