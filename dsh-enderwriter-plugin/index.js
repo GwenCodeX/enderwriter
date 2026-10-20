@@ -304,6 +304,13 @@ function renderRecall(res) {
     else lines.push('  （无匹配）')
   }
 
+  // 已废止的条目：正文不返回（避免新旧口径同时出现让模型无从判断），
+  // 但必须报出名字——"这条说法已作废"本身就是结论，藏起来反而误导。
+  if ((res.superseded ?? []).length) {
+    lines.push(`\n▸ 已废止（正文不返回，需要时用 enderwriter_recall 时指定精确实体名查看历史）`)
+    lines.push('  ' + res.superseded.join('、'))
+  }
+
   if ((res.errors ?? []).length) lines.push('\n⚠ ' + res.errors.join('；'))
   return lines.join('\n')
 }
@@ -684,12 +691,13 @@ export function apply(ctx, config) {
           if (!res.ok) return { ok: false, text: `检查失败：${res.message}` }
           const d = res.data
 
-          if (!d.facts_used) {
+          // 未执行（没有事实可核对）——这不是"通过"，必须说清。
+          // 把"查过了没问题"和"根本没查"混为一谈，比漏报更危险。
+          if (d.executed === false || !d.facts_used) {
             return {
               ok: true,
               text:
-                '【一致性检查】未执行——作品库里没有可用于核对的设定。\n' +
-                '（需要人物伤情/生死、物品持有者、境界这类可判定的事实）',
+                (d.notice ? `【一致性检查】未执行 —— ${d.notice}` : '【一致性检查】未执行——作品库里没有可用于核对的设定。\n（需要人物伤情/生死、物品持有者、境界这类可判定的事实）'),
             }
           }
 
@@ -705,8 +713,368 @@ export function apply(ctx, config) {
           for (const it of issues) {
             lines.push(`\n[${it.rule} ${it.rule_name}] ${it.detail}`)
             lines.push(`  正文：${it.quote}`)
+            // 让调用方知道可以标记误报
+            lines.push(`  如判为误报：enderwriter_feedback(kind="rule", ref="${it.rule}", verdict="fp")`)
           }
           return { ok: false, text: lines.join('\n') }
+        },
+      }),
+    ),
+  )
+
+  // ---- 整理与导出 ----
+  disposers.push(
+    registerTool(
+      makeTool({
+        name: 'enderwriter_organize',
+        description:
+          '整理末影箱 / 导出设定集。三种模式：' +
+          'mode=edges 从正文自动抽取实体关系（只写强边，弱边丢弃）；' +
+          'mode=report 给出整理清单（重复候选、孤立条目、已废止、从未使用），**不改任何内容**；' +
+          'mode=export 导出结构化 Markdown 设定集（按关系分层，原文一字不改）。' +
+          '整理不会自动合并条目——合并必须人工确认。',
+        parameters: {
+          type: 'object',
+          properties: {
+            mode: {
+              type: 'string',
+              enum: ['edges', 'report', 'export'],
+              description: 'edges=抽关系，report=整理清单，export=导出 Markdown',
+            },
+            title: { type: 'string', description: 'export 模式的文档标题' },
+            save: {
+              type: 'string',
+              description: 'export 模式可选：写到这个文件路径；不给则只返回文本',
+            },
+            min_weight: { type: 'integer', description: 'edges 模式：至少被提到几次才算强边，默认 2' },
+            include_history: { type: 'boolean', description: 'export 模式：是否附历史版本，默认 false' },
+            work: { type: 'string', description: '作品名；省略则用当前对话' },
+          },
+          required: ['mode'],
+        },
+        timeoutMs: 60000,
+        run: async (args, _ctx, sid) => {
+          const work = args.work || fixedWork
+          if (args.mode === 'edges') {
+            const res = await call(
+              'buildEdges',
+              { work, min_weight: args.min_weight || 2 },
+              60000,
+              sid,
+            )
+            if (!res.ok) return { ok: false, text: `抽取失败：${res.message}` }
+            return { ok: true, text: res.data.rendered || `写入 ${res.data.written} 条边` }
+          }
+          if (args.mode === 'export') {
+            const res = await call(
+              'export',
+              {
+                work,
+                title: args.title || '设定集',
+                save: args.save || '',
+                include_history: !!args.include_history,
+              },
+              60000,
+              sid,
+            )
+            if (!res.ok) return { ok: false, text: `导出失败：${res.message}` }
+            const d = res.data
+            return {
+              ok: true,
+              text:
+                `【导出完成】${d.chars} 字` +
+                (d.saved ? `，已写入 ${d.saved}` : '（未指定 save，仅返回文本）') +
+                '\n\n' +
+                String(d.markdown || '').slice(0, 4000),
+            }
+          }
+          const res = await call('organize', { work }, 60000, sid)
+          if (!res.ok) return { ok: false, text: `整理失败：${res.message}` }
+          return { ok: true, text: res.data.rendered }
+        },
+      }),
+    ),
+  )
+
+  // ---- 章节记录 ----
+  disposers.push(
+    registerTool(
+      makeTool({
+        name: 'enderwriter_chapter',
+        description:
+          '记录一章正文，并把它设为「当前章节」。' +
+          '记下来之后：recall 传 at_chapter 就只看这一章之前成立的设定；' +
+          '伏笔巡检能算出超期；写回能挂到具体章节上。' +
+          '长篇写作里，这一步让末影箱知道「你写到哪了」。',
+        parameters: {
+          type: 'object',
+          properties: {
+            chapter_id: { type: 'string', description: '章节号，如 ch_042' },
+            text: { type: 'string', description: '本章正文（可省略，只记录进度）' },
+            title: { type: 'string', description: '章节标题' },
+            summary: { type: 'string', description: '本章摘要' },
+            work: { type: 'string', description: '作品名；省略则用当前对话' },
+          },
+          required: ['chapter_id'],
+        },
+        timeoutMs: 60000,
+        run: async (args, _ctx, sid) => {
+          const res = await call(
+            'chapter',
+            {
+              work: args.work || fixedWork,
+              chapter_id: args.chapter_id,
+              text: args.text || '',
+              title: args.title || '',
+              summary: args.summary || '',
+            },
+            60000,
+            sid,
+          )
+          if (!res.ok) return { ok: false, text: `记录失败：${res.message}` }
+          const d = res.data
+          return {
+            ok: true,
+            text:
+              `【章节已记录】${d.chapter_id}\n` +
+              `  当前章节：${d.current_chapter}` +
+              (d.advanced ? '（进度已推进）' : '（早于当前进度，未回退）') +
+              `\n  已记录章节数：${d.chapters_total}`,
+          }
+        },
+      }),
+    ),
+  )
+
+  // ---- 导入既有文档 ----
+  disposers.push(
+    registerTool(
+      makeTool({
+        name: 'enderwriter_import',
+        description:
+          '从既有设定文档（.txt / .md）导入条目，反向建库。' +
+          '**默认只预演**：返回「会导入哪些条目、判成哪一层、多长」的清单，不写库。' +
+          '确认后传 dry_run=false 才真正写入。' +
+          '按文档标题自动分节与判层；「逐章细纲」这类写作产物默认跳过。',
+        parameters: {
+          type: 'object',
+          properties: {
+            path: { type: 'string', description: '文档路径（绝对路径或相对工作区）' },
+            dry_run: { type: 'boolean', description: 'true=只预演（默认），false=真正写入' },
+            layer: { type: 'string', enum: ['character', 'world', 'timeline', 'foreshadowing', 'item'], description: '兜底图层，默认 world' },
+            skip: { type: 'array', items: { type: 'string' }, description: '标题包含这些子串的分节跳过' },
+            chapter_id: { type: 'string', description: '把导入的条目挂到哪一章' },
+            work: { type: 'string', description: '作品名；省略则用当前对话' },
+          },
+          required: ['path'],
+        },
+        timeoutMs: 120000,
+        run: async (args, _ctx, sid) => {
+          const res = await call(
+            'import',
+            {
+              work: args.work || fixedWork,
+              path: args.path,
+              dry_run: args.dry_run !== false,
+              layer: args.layer || 'world',
+              skip: args.skip,
+              chapter_id: args.chapter_id || '',
+            },
+            120000,
+            sid,
+          )
+          if (!res.ok) return { ok: false, text: `导入失败：${res.message}` }
+          return { ok: true, text: res.data.rendered }
+        },
+      }),
+    ),
+  )
+
+  // ---- 误报反馈 ----
+  disposers.push(
+    registerTool(
+      makeTool({
+        name: 'enderwriter_feedback',
+        description:
+          '标记某条断言 / 一致性规则的命中是对是错。' +
+          '被判过多次误报的断言，之后在护栏输出里会标「历史上多次被判为误报，仅供参考」——' +
+          '这是让规则随使用变准的唯一途径。' +
+          'kind=assertion（断言 id）或 rule（R1..R5）；verdict=fp（误报）或 tp（真问题）。',
+        parameters: {
+          type: 'object',
+          properties: {
+            kind: { type: 'string', enum: ['assertion', 'rule'] },
+            ref: { type: 'string', description: '断言 id 或规则 id（如 unity-operator-eq-null-recursion / R1）' },
+            verdict: { type: 'string', enum: ['fp', 'tp'], description: 'fp=误报，tp=确实有问题' },
+            note: { type: 'string', description: '为什么算误报' },
+            work: { type: 'string', description: '作品名（反馈存在技术库，通常不需要）' },
+          },
+          required: ['kind', 'ref', 'verdict'],
+        },
+        timeoutMs: 30000,
+        run: async (args, _ctx, sid) => {
+          const res = await call(
+            'feedback',
+            { kind: args.kind, ref: args.ref, verdict: args.verdict, note: args.note || '' },
+            30000,
+            sid,
+          )
+          if (!res.ok) return { ok: false, text: `记录失败：${res.message}` }
+          const st = res.data.stats || {}
+          return {
+            ok: true,
+            text:
+              `【已记录】${args.kind}:${args.ref} → ${args.verdict === 'fp' ? '误报' : '真问题'}\n` +
+              `  累计：误报 ${st.fp || 0} · 真问题 ${st.tp || 0}` +
+              (st.fp_rate ? `（误报率 ${Math.round(st.fp_rate * 100)}%）` : ''),
+          }
+        },
+      }),
+    ),
+  )
+
+  // ---- 技术护栏 ----
+  disposers.push(
+    registerTool(
+      makeTool({
+        name: 'enderwriter_guard',
+        description:
+          '技术护栏：拿一段代码 / 配置 / 命令，看它踩中了哪些历史踩过的坑。' +
+          '断言来自真实事故复盘，命中会给出「后果」与「修法」。' +
+          '两种用法：' +
+          '① 传 text 检查代码特征（如重载 operator== 里用 == null 判空）；' +
+          '② 传 task 描述你正要做的任务（如「回写 DLL」），' +
+          '在动手之前拿到该任务必查的清单。' +
+          '注意：这是字面匹配，不理解语义；命中代表「这里可能有坑」，不是「一定有错」。',
+        parameters: {
+          type: 'object',
+          properties: {
+            text: { type: 'string', description: '要检查的代码或文本' },
+            task: {
+              type: 'string',
+              description: '要做的任务描述，用于匹配流程性断言（与 text 二选一或并用）',
+            },
+            min_severity: {
+              type: 'string',
+              enum: ['high', 'medium', 'low'],
+              description: '只看这个级别及以上的断言（默认 low = 全部）',
+            },
+            detailed: {
+              type: 'boolean',
+              description: '是否输出后果与修法，默认 true',
+            },
+          },
+        },
+        timeoutMs: 30000,
+        run: async (args, _ctx, sid) => {
+          if (!args.text && !args.task) {
+            return { ok: false, text: 'text 与 task 至少给一个' }
+          }
+          const res = await call(
+            'guard',
+            {
+              text: args.text || '',
+              task: args.task || '',
+              min_severity: args.min_severity || 'low',
+              detailed: args.detailed !== false,
+            },
+            30000,
+            sid,
+          )
+          if (!res.ok) return { ok: false, text: `护栏检查失败：${res.message}` }
+          const d = res.data
+          const hits = d.hits || []
+          return {
+            ok: true,
+            text: d.rendered || '（无输出）',
+            // 命中高严重度时用 ok:false，让调用方无法忽略
+            ...(hits.some((h) => h.severity === 'high') ? { ok: false } : {}),
+          }
+        },
+      }),
+    ),
+  )
+
+  // ---- 写入断言 ----
+  disposers.push(
+    registerTool(
+      makeTool({
+        name: 'enderwriter_assert',
+        description:
+          '把一条技术教训写成「可机械判定的断言」，以后写代码时会自动命中提醒。' +
+          '触发方式二选一或并用：detect_all 按代码特征触发；when 按任务意图触发。' +
+          '校验很严格（会拒绝条件过宽、过短、过于通用的断言）——' +
+          '一条永远误报的断言比没有断言更糟。',
+        parameters: {
+          type: 'object',
+          properties: {
+            id: { type: 'string', description: '断言标识，短横线命名，如 unity-operator-eq-null' },
+            rule: { type: 'string', description: '一句话规则（祈使句，说清必须/不许做什么）' },
+            detect_all: {
+              type: 'array',
+              items: { type: 'string' },
+              description: '代码特征：这些片段全部出现才命中（至少 2 个，除非 allow_single）',
+            },
+            detect_not: {
+              type: 'array',
+              items: { type: 'string' },
+              description: '出现这些说明已写对，不报警（如 ReferenceEquals）',
+            },
+            when: {
+              type: 'array',
+              items: { type: 'string' },
+              description: '任务意图关键词（如「回写 DLL」），动手前触发',
+            },
+            fix: { type: 'string', description: '具体修法，带 API 名' },
+            consequence: { type: 'string', description: '违反的实际后果，尽量带实测数字' },
+            severity: { type: 'string', enum: ['high', 'medium', 'low'] },
+            category: { type: 'string', description: '性能 / 兼容 / 构建 / 反编译 / 数据 / 其他' },
+            cases: {
+              type: 'array',
+              items: { type: 'string' },
+              description: '关联的技术库案例 ID',
+            },
+            allow_single: {
+              type: 'boolean',
+              description: '允许只有一个代码条件（仅用于极特定的信号，如 >g__）',
+            },
+            work: { type: 'string', description: '作品名（断言进技术库，通常不需要）' },
+          },
+          required: ['id', 'rule'],
+        },
+        timeoutMs: 30000,
+        run: async (args, _ctx, sid) => {
+          const res = await call(
+            'assert',
+            {
+              id: args.id,
+              rule: args.rule,
+              detect_all: args.detect_all,
+              detect_not: args.detect_not,
+              when: args.when,
+              fix: args.fix,
+              consequence: args.consequence,
+              severity: args.severity,
+              category: args.category,
+              cases: args.cases,
+              allow_single: args.allow_single,
+            },
+            30000,
+            sid,
+          )
+          if (!res.ok) return { ok: false, text: res.message }
+          const a = res.data.assertion || {}
+          return {
+            ok: true,
+            text:
+              `【断言已入库】${a.id}（${a.severity}）\n` +
+              `  规则：${a.rule}\n` +
+              (a.detect_all && a.detect_all.length
+                ? `  代码特征：${a.detect_all.join(' + ')}\n`
+                : '') +
+              (a.when && a.when.length ? `  任务意图：${a.when.join(' / ')}\n` : '') +
+              (a.fix ? `  修法：${a.fix}\n` : ''),
+          }
         },
       }),
     ),
@@ -1007,6 +1375,58 @@ export function apply(ctx, config) {
         )
         return r.ok ? { ok: true, value: r.data } : fail(r.message)
       }
+      case 'update': {
+        const r = await call(
+          'update',
+          {
+            layer: args.layer,
+            entity: args.entity,
+            content: args.content,
+            note: args.note || 'edit',
+            work: args.work || work,
+          },
+          60000,
+          sid,
+        )
+        return r.ok ? { ok: true, value: r.data } : fail(r.message)
+      }
+      case 'history': {
+        const r = await call(
+          'history',
+          { layer: args.layer, entity: args.entity, work: args.work || work },
+          60000,
+          sid,
+        )
+        return r.ok ? { ok: true, value: r.data } : fail(r.message)
+      }
+      case 'revert': {
+        const r = await call(
+          'revert',
+          {
+            layer: args.layer,
+            entity: args.entity,
+            version: args.version,
+            work: args.work || work,
+          },
+          60000,
+          sid,
+        )
+        return r.ok ? { ok: true, value: r.data } : fail(r.message)
+      }
+      case 'archive': {
+        const r = await call(
+          'archive',
+          {
+            layer: args.layer,
+            entity: args.entity,
+            archived: args.archived,
+            work: args.work || work,
+          },
+          60000,
+          sid,
+        )
+        return r.ok ? { ok: true, value: r.data } : fail(r.message)
+      }
       case 'works': {
         const r = await call('works', {}, 30000, sid)
         return r.ok ? { ok: true, value: r.data } : fail(r.message)
@@ -1015,8 +1435,16 @@ export function apply(ctx, config) {
         const r = await call('patrol', { ...args, work }, 45000, sid)
         return r.ok ? { ok: true, value: r.data } : fail(r.message)
       }
-      case 'setEnabled':
-        return { ok: true, value: { enabled: !!args.enabled, note: '面板开关仅影响显示，不改变记忆数据' } }
+      case 'setEnabled': {
+        // 持久化到库 meta；只影响面板显示，不动工具与数据
+        const r = await call(
+          'setEnabled',
+          { enabled: args.enabled !== false, work: args.work || fixedWork },
+          30000,
+          sid,
+        )
+        return r.ok ? { ok: true, value: r.data } : fail(r.message)
+      }
       default:
         return { ok: false, error: { code: 'unknown_endpoint', message: `未知端点：${method}`, details: {} } }
     }
@@ -1092,13 +1520,32 @@ export function apply(ctx, config) {
             remote === '::ffff:127.0.0.1' ||
             remote.startsWith('127.')
 
-          if (method !== 'GET') {
-            send(405, { ok: false, error: { code: 'method_not_allowed', message: '只支持 GET' } })
+          // 只读用 GET，写操作用 POST（正文太长，走查询串会被 URL 长度限制截断）
+          if (method !== 'GET' && method !== 'POST') {
+            send(405, { ok: false, error: { code: 'method_not_allowed', message: '只支持 GET / POST' } })
             return
           }
           if (!isLocal) {
             send(403, { ok: false, error: { code: 'forbidden', message: '只允许本机访问' } })
             return
+          }
+          // POST 的正文并入参数，与查询串里的字段同权
+          let bodyParams = {}
+          if (method === 'POST') {
+            try {
+              const chunks = []
+              let size = 0
+              for await (const chunk of req) {
+                size += chunk.length
+                if (size > 4 * 1024 * 1024) throw new Error('请求体超过 4MB')
+                chunks.push(chunk)
+              }
+              const raw = Buffer.concat(chunks).toString('utf8')
+              if (raw.trim()) bodyParams = JSON.parse(raw)
+            } catch (err) {
+              send(400, { ok: false, error: { code: 'bad_body', message: `请求体解析失败：${err}` } })
+              return
+            }
           }
 
           try {
@@ -1124,6 +1571,10 @@ export function apply(ctx, config) {
                 }
               }
               params[dec(k)] = dec(v)
+            }
+            // POST 的 body 与查询串同权（body 优先）
+            for (const [k, v] of Object.entries(bodyParams || {})) {
+              if (v !== undefined) params[k] = v
             }
 
             const sub = rawPath.replace(/^\/api\/enderwriter\/?/, '')
@@ -1186,6 +1637,68 @@ export function apply(ctx, config) {
               // 清除整库：真删库文件（会先备份），所以按钮必须走二次确认
               const r = await route('clear', {
                 target: params.target || 'work',
+                work: params.work || '',
+                sessionId: sid,
+              })
+              send(r.ok ? 200 : 500, r.ok ? { ok: true, ...r.value } : r)
+              return
+            }
+            if (sub === 'update') {
+              // 编辑正文：生成新版本，旧版全部保留
+              const r = await route('update', {
+                layer: params.layer || '',
+                entity: params.entity || '',
+                content: params.content,
+                note: params.note || 'edit',
+                work: params.work || '',
+                sessionId: sid,
+              })
+              send(r.ok ? 200 : 500, r.ok ? { ok: true, ...r.value } : r)
+              return
+            }
+            if (sub === 'history') {
+              // 版本历史：列出某条记忆的所有版本（旧版永不丢失）
+              const r = await route('history', {
+                layer: params.layer || '',
+                entity: params.entity || '',
+                work: params.work || '',
+                sessionId: sid,
+              })
+              send(r.ok ? 200 : 500, r.ok ? { ok: true, ...r.value } : r)
+              return
+            }
+            if (sub === 'revert') {
+              // 回滚：把旧版本内容写成新版本，历史链完整保留
+              const r = await route('revert', {
+                layer: params.layer || '',
+                entity: params.entity || '',
+                version: params.version,
+                work: params.work || '',
+                sessionId: sid,
+              })
+              send(r.ok ? 200 : 500, r.ok ? { ok: true, ...r.value } : r)
+              return
+            }
+            if (sub === 'archive') {
+              // 回收归档：只标记，不删除内容
+              const r = await route('archive', {
+                layer: params.layer || '',
+                entity: params.entity || '',
+                archived: params.archived === undefined ? true : !!params.archived,
+                work: params.work || '',
+                sessionId: sid,
+              })
+              send(r.ok ? 200 : 500, r.ok ? { ok: true, ...r.value } : r)
+              return
+            }
+            if (sub === 'setEnabled') {
+              // 面板的「启用/停用」开关。只影响显示与工具可用性，不动任何记忆数据。
+              const raw = params.enabled
+              const enabled = raw === undefined
+                ? true
+                : raw === true || raw === 'true' || raw === '1'
+              const r = await route('setEnabled', {
+                enabled,
                 work: params.work || '',
                 sessionId: sid,
               })
