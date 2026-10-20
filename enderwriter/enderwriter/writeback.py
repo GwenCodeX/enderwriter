@@ -55,6 +55,9 @@ log = get_logger("writeback")
 SEVERITY_OVERDUE = 0
 SEVERITY_STALE = 1
 SEVERITY_UNRESOLVED = 2
+#: 未定回收计划——不是写作出错，而是"这条伏笔无法被巡检"。
+#: 排在最后：它不紧急，但它是 patrol 失灵的根因，必须让人看见。
+SEVERITY_UNPLANNED = 3
 
 
 # --------------------------------------------------------------------------
@@ -749,6 +752,7 @@ _SEVERITY_ORDER: dict[str, int] = {
     "overdue": SEVERITY_OVERDUE,
     "stale": SEVERITY_STALE,
     "unresolved": SEVERITY_UNRESOLVED,
+    "unplanned": SEVERITY_UNPLANNED,
 }
 
 
@@ -852,6 +856,28 @@ def patrol(
                 }
             )
             _mark_abandon_candidate(chest, fs)
+
+        # 4) 未定回收计划：开着的伏笔没有 planned_resolve，巡检永远算不出超期。
+        #    这不是写作出错，而是**伏笔无法被看管**——把它显式报出来，
+        #    否则巡检会一直返回空，让人误以为"没有超期伏笔"。
+        if fs.is_open and planned_no < 0:
+            items.append(
+                {
+                    "type": "unplanned",
+                    "id": fs.id,
+                    "content": fs.content,
+                    "severity": SEVERITY_UNPLANNED,
+                    "status": fs.status,
+                    "planted_chapter": fs.planted_chapter,
+                    "planned_resolve": None,
+                    "suggestion": (
+                        f"伏笔 {fs.id} 没有设定回收章节，巡检无法判断是否超期。"
+                        f"补法：用 enderwriter_remember 写入时带上 "
+                        f"data.planned_resolve=\"ch_0XX\"，"
+                        f"或调用 enderwriter_foreshadow 补计划。"
+                    ),
+                }
+            )
 
     items.sort(key=lambda d: (_SEVERITY_ORDER.get(str(d["type"]), 9), str(d["id"])))
     return items
