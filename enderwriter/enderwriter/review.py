@@ -22,7 +22,10 @@
     R2 伤情违反      设定某部位受伤，正文让该部位做出需要完好的动作
     R3 持有者违反    设定物品在 A 手上，正文让 B 直接使用该物品
     R4 境界回退      设定境界为甲，正文声称其境界为更低的乙
-    R5 位置瞬移      设定角色在某地，正文突然出现在距离很远的地方
+    R5 位置瞬移      设定角色在某地，正文突然出现在另一个地名（启发式，low）
+
+R1-R4 是高置信规则；R5 依赖"看起来像地名"的启发式判断，只报 low，
+用来提示复核，不该据此阻断写作。
 
 ## 抽事实
 
@@ -31,6 +34,11 @@
   * 设定文本里的模式匹配（"左手受刀伤""已经死了""佩剑由主角乙保管"）
 
 后者是为了适配"只写设定、不写 state"的实际用法。
+
+## 没有事实时
+
+规则全部依赖事实，事实为空必然零命中。这时**不能**返回"通过"——
+那会被读成"查过了没问题"。此时 ``ok=False`` 且 ``notice`` 说明缺什么。
 """
 
 from __future__ import annotations
@@ -65,7 +73,7 @@ CONFLICT_RULES: tuple[dict[str, str], ...] = (
     {"id": "R2", "name": "伤情违反", "desc": "受伤部位做出需要完好的动作"},
     {"id": "R3", "name": "持有者违反", "desc": "物品在他人手中却由本角色直接使用"},
     {"id": "R4", "name": "境界回退", "desc": "正文声称的境界低于已确立境界"},
-    {"id": "R5", "name": "位置瞬移", "desc": "角色在短时间内出现在相隔很远的地点"},
+    {"id": "R5", "name": "位置瞬移", "desc": "角色出现在与记录不符的地名，且无位移描述（启发式）"},
 )
 
 
@@ -145,9 +153,19 @@ class Issue:
 
 
 class CheckResult:
-    """检查结论。"""
+    """检查结论。
 
-    __slots__ = ("ok", "issues", "facts_used", "rules_run")
+    ``notice`` 是**检查没真正执行**时的说明。
+
+    为什么需要它：规则要靠事实才能判定，事实为空时所有规则必然零命中。
+    如果这时仍返回 ``ok=True, issues=[]``，调用方会读成"检查过、没问题"——
+    这是比漏报更危险的情况：虚假的安全感。
+
+    所以事实为空（或规则一条都没跑）时 ``ok`` 必须是 False，
+    并在 ``notice`` 里说清缺什么、怎么补。
+    """
+
+    __slots__ = ("ok", "issues", "facts_used", "rules_run", "notice")
 
     def __init__(
         self,
@@ -156,11 +174,18 @@ class CheckResult:
         *,
         facts_used: int = 0,
         rules_run: Sequence[str] = (),
+        notice: str = "",
     ) -> None:
         self.ok = ok
         self.issues = list(issues or [])
         self.facts_used = facts_used
         self.rules_run = list(rules_run)
+        self.notice = notice
+
+    @property
+    def executed(self) -> bool:
+        """检查是否真的执行了（有事实 + 跑了规则）。"""
+        return bool(self.facts_used) and bool(self.rules_run) and not self.notice
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -168,9 +193,13 @@ class CheckResult:
             "issues": [i.to_dict() for i in self.issues],
             "facts_used": self.facts_used,
             "rules_run": self.rules_run,
+            "executed": self.executed,
+            "notice": self.notice,
         }
 
     def render(self) -> str:
+        if self.notice:
+            return f"【一致性检查】未执行 —— {self.notice}"
         if not self.issues:
             return f"【一致性检查】通过（{self.facts_used} 条事实 / {len(self.rules_run)} 条规则）"
         lines = [f"【一致性检查】发现 {len(self.issues)} 处冲突"]
@@ -523,20 +552,152 @@ def _rule_realm(text: str, facts: Iterable[Fact]) -> list[Issue]:
     return out
 
 
+#: 地点后缀词——用来判断一个词像不像地名。
+#: 这是启发式：只有看起来像地名时才做位置比对，
+#: 否则「张三在家里」「张三在心里想」都会误报。
+_PLACE_SUFFIX = (
+    "城", "市", "县", "镇", "村", "区", "街", "路", "巷", "大道",
+    "山", "峰", "岭", "崖", "谷", "林", "原", "野", "漠",
+    "河", "江", "湖", "海", "湾", "溪", "泉", "潭",
+    "岛", "州", "港", "关", "门", "桥", "塔", "楼", "阁", "殿", "宫", "寺", "庙",
+    "院", "府", "宅", "营", "寨", "堡", "仓", "厂", "园", "场", "站", "厅", "室",
+    "国", "界", "境", "域", "州",
+)
+
+#: 非地点的「在 X」惯用搭配，命中就跳过
+_PLACE_STOP = (
+    "心里", "心中", "眼里", "眼中", "手里", "手中", "口中", "嘴中",
+    "面前", "身后", "身上", "旁边", "附近", "周围", "之后", "之前",
+    "这时", "那时", "此刻", "当时", "现在", "现场", "本质上", "意义上",
+)
+
+#: 位移动词——出现这些说明角色在移动，位置变化合理，不报警
+_MOVE_VERBS = (
+    "来到", "走进", "走入", "进入", "进了", "抵达", "到达", "赶到", "赶往",
+    "前往", "去了", "去了", "回到", "回到", "返回", "离开", "撤离", "逃往",
+    "飞往", "传送", "瞬移", "冲进", "闯入", "踏入", "步入", "登上", "下了",
+)
+
+
+def _looks_like_place(word: str) -> bool:
+    """粗判一个词像不像地名。"""
+    if not word or len(word) < 2:
+        return False
+    if word in _PLACE_STOP:
+        return False
+    return any(word.endswith(s) for s in _PLACE_SUFFIX)
+
+
+#: 方位后缀——「青云山上」要还原成「青云山」再判地名
+_LOC_SUFFIX_RE = re.compile(
+    r"(?:的上面|的下面|的里面|的外面|之中|之上|之下|附近|一带|周边|里头|外边|[上中里内外边处间面])$"
+)
+
+
+def _extract_places(text: str, subject: str) -> list[tuple[str, str]]:
+    """抽取「某主体 + 在/位于 + 地点」的静态位置陈述。
+
+    返回 [(地点, 原句片段)]。
+
+    只认**静态**位置（在/位于/身处），不认位移动词——
+    「张三走进大殿」是移动，不是"身处别处"。
+    """
+    out: list[tuple[str, str]] = []
+    if not subject:
+        return out
+
+    # 位移句先剔除，避免把「来到X」当成「在X」
+    for m in re.finditer(re.escape(subject) + r".{0,6}?在(?P<place>[^，。；！？、\n]{1,10})", text):
+        head = m.group(0)
+        if any(v in head for v in _MOVE_VERBS):
+            continue
+        place = m.group("place").strip()
+        # 地点后面可能跟着助词/动词，截掉
+        place = re.split(r"[的地得着了过]", place)[0].strip()
+        # 「青云山上」→「青云山」，方位词不参与地名判定
+        place = _LOC_SUFFIX_RE.sub("", place).strip()
+        if not _looks_like_place(place):
+            continue
+        out.append((place, head))
+    return out
+
+
+def _rule_location(text: str, facts: Iterable[Fact]) -> list[Issue]:
+    """R5 位置瞬移：正文把角色放在与已记录不同的地点，且没有位移过程。
+
+    注意这是**启发式**规则，置信度低于 R1-R4：
+      * 只在两个地点完全不像时报警（无共同字）
+      * 只认「看起来像地名」的词
+      * 只报 low，不阻断写作，供人复核
+    """
+    out: list[Issue] = []
+    for f in facts:
+        if f.kind != "location":
+            continue
+        subject = f.subject
+        known = str(f.value or "").strip()
+        if not _looks_like_place(known):
+            continue
+        for place, quote in _extract_places(text, subject):
+            # 两个地名有共同字，视为同一地点或上下级关系，不报
+            if set(place) & set(known):
+                continue
+            if place in known or known in place:
+                continue
+            out.append(
+                Issue(
+                    "R5",
+                    "位置瞬移",
+                    subject,
+                    quote,
+                    fact_id=f.id,
+                    detail=(
+                        f"{subject} 上次记录在「{known}」，"
+                        f"正文这里出现在「{place}」，中间没有位移描述"
+                    ),
+                    severity="low",
+                )
+            )
+    return out
+
+
 def check_text(text: str, facts: Sequence[Fact], *, rules: Sequence[str] | None = None) -> CheckResult:
     """按规则检查正文。
 
     rules 为空则跑全部规则。
+
+    两个「未执行」的情况会返回 ``ok=False`` + ``notice``，而不是伪装成通过：
+      * 没有任何事实 —— 规则无从判定
+      * 正文为空
     """
     body = str(text or "")
     if not body.strip():
-        return CheckResult(True, facts_used=len(facts), rules_run=[])
+        return CheckResult(
+            False,
+            facts_used=len(facts),
+            rules_run=[],
+            notice="正文为空，没有可检查的内容",
+        )
+
+    if not facts:
+        return CheckResult(
+            False,
+            facts_used=0,
+            rules_run=[],
+            notice=(
+                "这个作品库里没有可用于核对的设定事实，规则无法判定。\n"
+                "补法二选一：\n"
+                "  1) 用 enderwriter_writeback 写入 state（alive / injury / owner / realm / location）\n"
+                "  2) 在设定正文里写明「左手受刀伤」「已死」「佩剑由某某保管」等可识别表述"
+            ),
+        )
 
     runners = {
         "R1": _rule_alive,
         "R2": _rule_injury,
         "R3": _rule_owner,
         "R4": _rule_realm,
+        "R5": _rule_location,
     }
     wanted = list(rules) if rules else list(runners)
 
