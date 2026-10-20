@@ -98,6 +98,43 @@ CREATE TABLE IF NOT EXISTS chapters (
     word_count INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL
 );
+-- 使用记录：一条记忆被检索到几次、最近一次是什么时候、是否已回收归档。
+--
+-- 单独建表而不是塞进 records.data，原因有两个：
+--   1. data 参与版本管理，每次命中都 bump version 会把 history 撑爆
+--   2. 使用记录是"关于记忆的元数据"，与内容本身的生命周期不同
+--
+-- 重要：这张表**只增不删**。末影箱在文学场景下兼当设定集，
+-- 任何一条设定都可能在几百章后被再次引用，删掉等于永久丢失。
+-- 所以这里只有"未使用 / 已使用"，没有"过期删除"。
+CREATE TABLE IF NOT EXISTS usage (
+    layer       TEXT NOT NULL,
+    entity      TEXT NOT NULL,
+    hit_count   INTEGER NOT NULL DEFAULT 0,
+    first_hit_at TEXT,
+    last_hit_at TEXT,
+    archived    INTEGER NOT NULL DEFAULT 0,
+    archived_at TEXT,
+    note        TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (layer, entity)
+);
+CREATE INDEX IF NOT EXISTS idx_usage_last ON usage(last_hit_at);
+-- 反馈记录：规则 / 断言命中后，人判它对不对。
+--
+-- 没有这张表时，误报无处消化：断言报错了你说"这是误报"，
+-- 系统记不住，下次还报，报到你把功能关掉为止。
+--
+-- kind   assertion（技术断言 id）| rule（R1..R5）
+-- verdict fp（误报）| tp（确实有问题）
+CREATE TABLE IF NOT EXISTS feedback (
+    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind    TEXT NOT NULL,
+    ref     TEXT NOT NULL,
+    verdict TEXT NOT NULL,
+    note    TEXT NOT NULL DEFAULT '',
+    at      TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_feedback_ref ON feedback(kind, ref);
 """
 
 
@@ -672,8 +709,86 @@ class EnderChest:
         self.conn.commit()
         return True
 
+    # ------------------------------------------------------------------
+    # 元信息（当前章节等）
+    # ------------------------------------------------------------------
+    def set_meta(self, key: str, value: str, *, commit: bool = True) -> None:
+        """写入一条库级元信息。"""
+        try:
+            self.conn.execute(
+                "INSERT INTO meta(key, value) VALUES(?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (str(key), str(value)),
+            )
+            if commit:
+                self.conn.commit()
+        except sqlite3.Error as exc:
+            log.warning("写 meta 失败 %s：%s", key, exc)
+
+    def get_meta(self, key: str, default: str = "") -> str:
+        """读取一条库级元信息。"""
+        try:
+            row = self.conn.execute(
+                "SELECT value FROM meta WHERE key=?", (str(key),)
+            ).fetchone()
+        except sqlite3.Error:
+            return default
+        return str(row["value"]) if row else default
+
+    @property
+    def current_chapter(self) -> str:
+        """这个作品「写到第几章」——用于按叙事位置检索。"""
+        return self.get_meta("current_chapter", "")
+
+    # ------------------------------------------------------------------
+    # 反馈记录：规则/断言命中的对错判定
+    # ------------------------------------------------------------------
+    def add_feedback(
+        self, kind: str, ref: str, verdict: str, *, note: str = "", commit: bool = True
+    ) -> None:
+        """记一次判定：``fp``=误报，``tp``=确实有问题。"""
+        v = str(verdict or "").strip().lower()
+        if v not in ("fp", "tp"):
+            raise ValueError(f"verdict 只能是 fp / tp，收到 {verdict!r}")
+        try:
+            self.conn.execute(
+                "INSERT INTO feedback(kind, ref, verdict, note, at) VALUES(?,?,?,?,?)",
+                (str(kind), str(ref), v, str(note or ""), _now()),
+            )
+            if commit:
+                self.conn.commit()
+        except sqlite3.Error as exc:
+            log.warning("写反馈失败：%s", exc)
+
+    def feedback_stats(self, kind: str = "", ref: str = "") -> dict[str, Any]:
+        """统计：每条规则/断言被判过几次误报、几次真问题。"""
+        out: dict[str, dict[str, int]] = {}
+        try:
+            sql = "SELECT kind, ref, verdict, COUNT(*) AS n FROM feedback"
+            cond, params = [], []
+            if kind:
+                cond.append("kind=?")
+                params.append(kind)
+            if ref:
+                cond.append("ref=?")
+                params.append(ref)
+            if cond:
+                sql += " WHERE " + " AND ".join(cond)
+            sql += " GROUP BY kind, ref, verdict"
+            rows = self.conn.execute(sql, params).fetchall()
+        except sqlite3.Error:
+            return {}
+        for r in rows:
+            key = f"{r['kind']}:{r['ref']}"
+            slot = out.setdefault(key, {"fp": 0, "tp": 0})
+            slot[str(r["verdict"])] = int(r["n"])
+        for slot in out.values():
+            total = slot["fp"] + slot["tp"]
+            slot["total"] = total
+            slot["fp_rate"] = round(slot["fp"] / total, 3) if total else 0.0
+        return out
+
     def counts(self) -> dict[str, int]:
-        """各格子的记录数（不含已删除的）。"""
         rows = self.conn.execute(
             "SELECT layer, COUNT(*) AS n FROM records GROUP BY layer"
         ).fetchall()
@@ -681,6 +796,138 @@ class EnderChest:
         for r in rows:
             out[r["layer"]] = int(r["n"])
         return out
+
+    # ------------------------------------------------------------------
+    # 使用记录（回收归档）
+    #
+    # 设计约束：**只标记，不删除**。
+    # 末影箱在文学场景下兼当设定集，一条设定可能在几百章后被再次引用，
+    # 删掉等于永久丢失。所以这里只有「未使用 / 已使用（归档）」两种状态。
+    # ------------------------------------------------------------------
+    def bump_usage(self, layer: str, entity: str, *, commit: bool = True) -> None:
+        """记一次命中：计数 +1，刷新最近使用时间，并置为「已回收归档」。
+
+        「AI 用了就算回收」——这条记录已经进入过写作上下文、发挥过作用。
+        但**内容一条不删**：归档只是状态标记，设定集里的条目
+        随时还要能查、能引用、能参与一致性核对。
+
+        不参与版本管理，也不写 history——使用记录是元数据，
+        不该把内容版本号推高。
+        """
+        now = _now()
+        try:
+            self.conn.execute(
+                "INSERT INTO usage(layer, entity, hit_count, first_hit_at, last_hit_at, archived, archived_at) "
+                "VALUES(?, ?, 1, ?, ?, 1, ?) "
+                "ON CONFLICT(layer, entity) DO UPDATE SET "
+                "hit_count = hit_count + 1, last_hit_at = excluded.last_hit_at, "
+                "archived = 1, "
+                "archived_at = COALESCE(usage.archived_at, excluded.archived_at)",
+                (layer, entity, now, now, now),
+            )
+            if commit:
+                self.conn.commit()
+        except sqlite3.Error:
+            # 使用记录失败绝不该影响检索本身
+            pass
+
+    def usage_of(self, layer: str, entity: str) -> dict[str, Any] | None:
+        """某条记录的使用情况；从未命中过返回 None。"""
+        try:
+            row = self.conn.execute(
+                "SELECT * FROM usage WHERE layer=? AND entity=?", (layer, entity)
+            ).fetchone()
+        except sqlite3.Error:
+            return None
+        if not row:
+            return None
+        return {
+            "hit_count": int(row["hit_count"] or 0),
+            "first_hit_at": row["first_hit_at"],
+            "last_hit_at": row["last_hit_at"],
+            "archived": bool(row["archived"]),
+            "archived_at": row["archived_at"],
+            "note": row["note"] or "",
+        }
+
+    def usage_map(self) -> dict[tuple[str, str], dict[str, Any]]:
+        """整库的使用情况，键是 (layer, entity)。"""
+        out: dict[tuple[str, str], dict[str, Any]] = {}
+        try:
+            rows = self.conn.execute("SELECT * FROM usage").fetchall()
+        except sqlite3.Error:
+            return out
+        for row in rows:
+            out[(row["layer"], row["entity"])] = {
+                "hit_count": int(row["hit_count"] or 0),
+                "first_hit_at": row["first_hit_at"],
+                "last_hit_at": row["last_hit_at"],
+                "archived": bool(row["archived"]),
+                "archived_at": row["archived_at"],
+                "note": row["note"] or "",
+            }
+        return out
+
+    def set_archived(
+        self, layer: str, entity: str, archived: bool = True, *, note: str = ""
+    ) -> bool:
+        """手动设置/取消「已回收归档」。
+
+        归档只影响面板上的归类与提示，**不影响检索**——
+        设定集里的每一条都必须随时可查。
+        """
+        now = _now()
+        try:
+            if archived:
+                self.conn.execute(
+                    "INSERT INTO usage(layer, entity, hit_count, archived, archived_at, note) "
+                    "VALUES(?, ?, 0, 1, ?, ?) "
+                    "ON CONFLICT(layer, entity) DO UPDATE SET "
+                    "archived = 1, archived_at = excluded.archived_at, "
+                    "note = excluded.note",
+                    (layer, entity, now, note),
+                )
+            else:
+                self.conn.execute(
+                    "INSERT INTO usage(layer, entity, hit_count, archived) "
+                    "VALUES(?, ?, 0, 0) "
+                    "ON CONFLICT(layer, entity) DO UPDATE SET archived = 0, archived_at = NULL",
+                    (layer, entity),
+                )
+            self.conn.commit()
+            return True
+        except sqlite3.Error:
+            return False
+
+    def usage_summary(self) -> dict[str, int]:
+        """使用概况：已归档 / 用过未归档 / 从未使用。"""
+        total = 0
+        try:
+            total = int(
+                self.conn.execute("SELECT COUNT(*) FROM records").fetchone()[0]
+            )
+        except sqlite3.Error:
+            return {"total": 0, "archived": 0, "used": 0, "unused": 0}
+
+        archived = used = 0
+        try:
+            row = self.conn.execute(
+                "SELECT "
+                "SUM(CASE WHEN archived=1 THEN 1 ELSE 0 END) AS a, "
+                "SUM(CASE WHEN archived=0 AND hit_count>0 THEN 1 ELSE 0 END) AS u "
+                "FROM usage"
+            ).fetchone()
+            archived = int(row["a"] or 0)
+            used = int(row["u"] or 0)
+        except sqlite3.Error:
+            pass
+
+        return {
+            "total": total,
+            "archived": archived,
+            "used": used,
+            "unused": max(0, total - archived - used),
+        }
 
     def get(self, layer: str, entity: str) -> Record | None:
         e = self.resolve_entity(entity) if layer != "alias" else normalize_name(entity)
