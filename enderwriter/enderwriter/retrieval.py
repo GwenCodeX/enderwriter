@@ -59,6 +59,16 @@ _WEAK_FLOOR = 0.28
 _LOW_CLIP_MAX = 60
 _LOW_SAMPLE_TOKENS = 40
 
+#: medium 档单条摘要的**可读下限**（token）。
+#:
+#: 约 55 个汉字——够看清一句完整的话。低于这个长度，摘要会比条目名还短，
+#: 读者拿不到任何信息。宁可少返回几条，也不要返回一堆看不懂的碎片。
+_MEDIUM_MIN_SHARE = 80
+
+#: medium 档单条摘要的**绝对下限**：剩余预算低于此值就不再切，
+#: 因为切出来只剩标点，纯属噪音。
+_MEDIUM_FLOOR_SHARE = 40
+
 
 def _est(text: str) -> int:
     return C.est_tokens(text)
@@ -74,6 +84,69 @@ def rendered_cost(hit: Hit) -> int:
     if getattr(hit, "in_context", False):
         return _est("已在上下文")
     return _est(hit.content)
+
+
+#: 废止状态只认**显式标记**，不从正文猜测。
+#:
+#: 试过用「已废止 / 已作废」这类词做正文匹配，实测**全是误判**：
+#: 一条记录说「X 已废止」时，它通常是**取代 X 的那条**（现行版），
+#: 而不是被废止的那条。例如「战力牌级表」正文写着
+#: 「字母记法…已废止，唯一有效的体系就是本条」——它是现行口径。
+#:
+#: 所以废止必须由人（或工具 :op:`markSuperseded`）显式声明。
+_SUPERSEDED_STATUS = frozenset({"superseded", "deprecated", "obsolete"})
+
+
+def is_superseded(rec: Any) -> bool:
+    """这条记录是否被显式标记为「已废止」。"""
+    data = getattr(rec, "data", None) or {}
+    if not isinstance(data, dict):
+        return False
+    if data.get("superseded") is True:
+        return True
+    return str(data.get("status") or "").lower() in _SUPERSEDED_STATUS
+
+
+#: 内部别名，供 _classify 使用
+_is_superseded = is_superseded
+
+
+def _chapter_gate(rec: Any, at_no: int) -> bool:
+    """这条记录在 ``at_no`` 章时是否已经成立。
+
+    ``data.valid_from`` / ``data.valid_until`` 记录设定的生效区间。
+    没写这两个字段的记录一律视为"一直成立"——不能因为缺元数据就把它排除掉。
+
+    :returns: True 表示可以返回
+    """
+    if at_no < 0:
+        return True
+    data = getattr(rec, "data", None) or {}
+    if not isinstance(data, dict):
+        return True
+    try:
+        vf = data.get("valid_from")
+        if vf:
+            start = _chapter_no(str(vf))
+            if start >= 0 and start > at_no:
+                return False
+        vu = data.get("valid_until")
+        if vu:
+            end = _chapter_no(str(vu))
+            if end >= 0 and end < at_no:
+                return False
+    except Exception:  # noqa: BLE001
+        return True
+    return True
+
+
+def _chapter_no(chapter_id: str) -> int:
+    from .common import chapter_index
+
+    try:
+        return chapter_index(chapter_id)
+    except Exception:  # noqa: BLE001
+        return -1
 
 
 class MemoryKeeper:
@@ -121,6 +194,8 @@ class MemoryKeeper:
         req = dict(req)
         entities_in: list[str] = [str(x) for x in req["entities"]]
         query_context: str = str(req.get("query_context") or "")
+        # 按叙事位置检索：写第 N 章时只看到"到第 N 章为止已成立"的设定
+        at_chapter: str = str(req.get("at_chapter") or "")
         layers: list[str] | None = list(req["layers"]) if req.get("layers") else None
         budget: int = int(req.get("budget") or self.default_budget)
         if budget <= 0:  # 双保险：Schema 已挡 <=0，这里兼容以 default_budget 被调坏
@@ -137,7 +212,7 @@ class MemoryKeeper:
         channels = self._recall(entities, query_context, layers, alias_map, trace)
 
         # --- 4) 三档分层 -----------------------------------------------
-        bands = self._classify(channels, ctx_set, trace)
+        bands, superseded = self._classify(channels, ctx_set, trace, at_chapter=at_chapter)
 
         # --- 5) 预算分档 + 6) 总预算裁剪 --------------------------------
         buckets = self._allocate(bands, budget, ctx_set, canonical_aliases, trace)
@@ -149,12 +224,30 @@ class MemoryKeeper:
         used = sum(rendered_cost(h) for h in (*high, *medium, *low))
         elapsed_ms = round((time.perf_counter() - t0) * 1000.0, 3)
 
+        # --- 记录使用（回收归档） ---------------------------------------
+        #
+        # 语义：一条记忆被检索进上下文，就算"被用过了"，标记为已回收归档。
+        #
+        # 三个约束：
+        #   1. **只标记，不删除**。设定集里的条目可能在几百章后被再次引用。
+        #   2. 不写 history、不推版本号——使用记录是元数据，不是内容变更。
+        #   3. 失败静默：统计不该影响检索本身。
+        try:
+            for h in (*high, *medium, *low):
+                self.chest.bump_usage(h.layer, h.entity, commit=False)
+            self.chest.conn.commit()
+        except Exception as exc:  # noqa: BLE001
+            self.log.debug("记录使用失败：%s", exc)
+
         result: dict[str, Any] = {
             "high": [h.to_dict() for h in high],
             "medium": [h.to_dict() for h in medium],
             "low": [h.to_dict() for h in low],
             "total_tokens": int(used),
             "elapsed_ms": elapsed_ms,
+            # 已废止的记录：正文不返回（避免与现行口径冲突），
+            # 但实体名要报出来——"这条说法已作废"本身就是有用信息。
+            "superseded": sorted(set(superseded)),
             "normalized": {
                 "input": entities_in,
                 "entities": entities,
@@ -384,11 +477,32 @@ class MemoryKeeper:
         channels: dict[tuple[str, str], dict[str, Any]],
         ctx_set: set[str],
         trace: list[str],
-    ) -> dict[str, list[dict[str, Any]]]:
-        """把候选分成 high / medium / low 三档，每档内按综合分降序。"""
+        *,
+        at_chapter: str = "",
+    ) -> tuple[dict[str, list[dict[str, Any]]], list[str]]:
+        """把候选分成 high / medium / low 三档，每档内按综合分降序。
+
+        两类记录**不进任何一档**：
+
+        * 已废止（``data.superseded``）——旧说法与现行冲突，正文不返回，
+          只把实体名收进第二个返回值
+        * 在 ``at_chapter`` 之后才成立（``data.valid_from``）——未来设定，
+          当前章节不该看到
+
+        报出被排除的已废止条目比悄悄丢掉更有用，所以单独返回实体名。
+        """
         bands: dict[str, list[dict[str, Any]]] = {"high": [], "medium": [], "low": []}
+        superseded: list[str] = []
+        at_no = _chapter_no(at_chapter) if at_chapter else -1
+        future = 0
         for key, slot in channels.items():
             rec: Record = slot["record"]
+            if _is_superseded(rec):
+                superseded.append(rec.entity)
+                continue
+            if not _chapter_gate(rec, at_no):
+                future += 1
+                continue
             # exact 通道单独加权；weak 是二跳弱关联；其余（terms/vector/graph/alias:*）为常规证据
             strong = [c for c in slot["channels"] if c not in ("exact", "weak")]
             # 别名归因不算独立证据（它与 terms 出自同一次倒排召回）
@@ -419,7 +533,11 @@ class MemoryKeeper:
         for name, items in bands.items():
             items.sort(key=lambda it: (-it["score"], it["key"][0], it["key"][1]))
             trace.append(f"classify/{name}: {len(items)} 条")
-        return bands
+        if superseded:
+            trace.append(f"classify/superseded: 已废止 {len(superseded)} 条不入档")
+        if future:
+            trace.append(f"classify/future: 第 {at_chapter} 章尚未成立 {future} 条不入档")
+        return bands, superseded
 
     @staticmethod
     def _score(slot: dict[str, Any]) -> float:
@@ -492,15 +610,33 @@ class MemoryKeeper:
         trace.append(f"budget/high: {used_high}/{caps['high']} tokens（完整正文，{len(out['high'])} 条）")
 
         # ---- medium：clip_tokens 摘要（分池，<= 35% 总预算） ----
+        #
+        # 关键改动：**不再把预算平均切给每一条**。
+        #
+        # 原来按 cap/n 均分：22 条候选、280 token 预算 → 每条 12 token ≈ 8 个汉字，
+        # 而条目名本身就有 10~15 字，摘要比标题还短，等于没有。
+        #
+        # 现在给每条一个**可读下限**（_MEDIUM_MIN_SHARE），预算不够时
+        # 只返回靠前的几条完整摘要，而不是把每条都压成 8 个字——
+        # 三条看得懂的摘要，比二十二条看不懂的有用。
         cap = min(caps["medium"] + (caps["high"] - used_high), total_left)
-        medium_size = max(1, int(caps["medium"] / max(1, len(bands["medium"]))))
+        cap_initial = cap
+        skipped_medium = 0
+        left_count = max(1, len(bands["medium"]))
         for item in bands["medium"]:
             rec: Record = item["record"]
             in_ctx = rec.entity in ctx_set
+            if cap <= 0 or total_left <= 0:
+                skipped_medium += 1
+                continue
+            fair = cap // max(1, left_count)
+            share = min(max(fair, _MEDIUM_MIN_SHARE), cap)
+            if share < _MEDIUM_FLOOR_SHARE:
+                # 剩下的预算已经不够说清一句话，再切只会产出噪音
+                skipped_medium += 1
+                left_count -= 1
+                continue
             full = self._render(rec, item, canonical_aliases, in_ctx)
-            share = min(medium_size, cap)
-            if share <= 0 or total_left <= 0:
-                break
             content = C.clip_tokens(full, share)
             hit = rec.to_hit(band="medium", confidence=item["confidence"])
             hit.in_context = in_ctx
@@ -509,8 +645,14 @@ class MemoryKeeper:
             out["medium"].append(hit)
             total_left -= cost
             cap -= cost
+            left_count -= 1
         used_medium = sum(rendered_cost(h) for h in out["medium"])
-        trace.append(f"budget/medium: {used_medium}/{caps['medium']} tokens（摘要，{len(out['medium'])} 条）")
+        trace.append(
+            f"budget/medium: {used_medium}/{cap_initial} tokens"
+            f"（摘要 {len(out['medium'])} 条"
+            + (f"，预算不足跳过 {skipped_medium} 条" if skipped_medium else "")
+            + "）"
+        )
 
         # ---- low：只抽样 1~2 条，极短摘要 + band 标记（独立分池 <= 15% 总预算） ----
         cap = min(caps["low"] + (caps["medium"] - used_medium), total_left)
