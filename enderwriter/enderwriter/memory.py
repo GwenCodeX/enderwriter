@@ -30,8 +30,11 @@ from .common import LAYERS, get_logger
 __all__ = [
     "SCOPE_WORK",
     "SCOPE_GLOBAL",
+    "SCOPE_TECH",
     "SESSION_PREFIX",
     "GLOBAL_LAYERS",
+    "TECH_LAYERS",
+    "WORK_LAYERS",
     "WorkMemory",
     "default_home",
     "list_works",
@@ -45,11 +48,15 @@ log = get_logger("memory")
 
 SCOPE_WORK = "work"
 SCOPE_GLOBAL = "global"
+#: 技术库：跨项目的工程经验与断言，与作品库/文学库完全分开。
+SCOPE_TECH = "tech"
 
 #: 这些层是"文学经验"，默认进全局库
 GLOBAL_LAYERS: frozenset[str] = frozenset({"style"})
+#: 这些层是"技术断言"，默认进技术库
+TECH_LAYERS: frozenset[str] = frozenset({"assertion"})
 #: 这些层是"作品细节"，默认进作品库
-WORK_LAYERS: frozenset[str] = frozenset(set(LAYERS) - GLOBAL_LAYERS)
+WORK_LAYERS: frozenset[str] = frozenset(set(LAYERS) - GLOBAL_LAYERS - TECH_LAYERS)
 
 _CJK_RE = re.compile(r"[\u4e00-\u9fff]")
 
@@ -87,12 +94,18 @@ def route(layer: str, *, scope: str | None = None) -> str:
     """决定一条记录该进哪个库。
 
     ``scope`` 显式给出时直接采用（用户/工具说了算）；
-    否则按层路由：style → 全局，其余 → 作品。
+    否则按层路由：
+
+        style      → 全局文学库（跨作品的写作经验）
+        assertion  → 技术库（跨项目的技术断言）
+        其余        → 作品库
     """
-    if scope in (SCOPE_WORK, SCOPE_GLOBAL):
+    if scope in (SCOPE_WORK, SCOPE_GLOBAL, SCOPE_TECH):
         return scope
     if layer == "style":
         return SCOPE_GLOBAL
+    if layer == "assertion":
+        return SCOPE_TECH
     return SCOPE_WORK
 
 
@@ -171,8 +184,16 @@ class WorkMemory:
     def global_path(self) -> str:
         return os.path.join(self.home, "global.db")
 
+    @property
+    def tech_path(self) -> str:
+        return os.path.join(self.home, "tech.db")
+
     def path_for(self, scope: str) -> str:
-        return self.global_path if scope == SCOPE_GLOBAL else self.work_path
+        if scope == SCOPE_GLOBAL:
+            return self.global_path
+        if scope == SCOPE_TECH:
+            return self.tech_path
+        return self.work_path
 
     def exists(self, scope: str) -> bool:
         return bool(self.path_for(scope)) and os.path.isfile(self.path_for(scope))
@@ -206,6 +227,9 @@ class WorkMemory:
 
     def global_chest(self):
         return self.open(SCOPE_GLOBAL)
+
+    def tech_chest(self):
+        return self.open(SCOPE_TECH)
 
     # -- 概况 ----------------------------------------------------------
     def describe(self) -> dict[str, Any]:
