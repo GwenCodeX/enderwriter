@@ -178,15 +178,40 @@ class TestRules(unittest.TestCase):
 
 
 class TestCheckResult(unittest.TestCase):
-    def test_empty_text_passes(self):
+    def test_empty_text_not_executed(self):
+        """空正文不能报"通过"——什么都没查。"""
         r = check_text("", [])
-        self.assertTrue(r.ok)
+        self.assertFalse(r.ok)
+        self.assertEqual(r.issues, [])
+        self.assertFalse(r.executed)
+        self.assertIn("正文为空", r.notice)
+
+    def test_no_facts_not_executed(self):
+        """没有事实也不能报"通过"——规则无从判定。
+
+        这是关键语义：ok=False 表示"没查成"，不是"查出问题"。
+        区分二者靠 executed 与 issues。
+        """
+        r = check_text("随便一段正文。", [])
+        self.assertFalse(r.ok)
+        self.assertEqual(r.facts_used, 0)
+        self.assertFalse(r.executed)
+        self.assertIn("没有可用于核对", r.notice)
         self.assertEqual(r.issues, [])
 
-    def test_no_facts_passes(self):
-        r = check_text("随便一段正文。", [])
-        self.assertTrue(r.ok)
-        self.assertEqual(r.facts_used, 0)
+    def test_notice_serialized(self):
+        r = check_text("正文。", [])
+        d = r.to_dict()
+        self.assertIn("executed", d)
+        self.assertFalse(d["executed"])
+        self.assertTrue(d["notice"])
+
+    def test_with_facts_executed(self):
+        """有事实时才是真执行，notice 应为空。"""
+        f = Fact("s:1", "realm", "甲", "白牌")
+        r = check_text("甲走了进来。", [f])
+        self.assertTrue(r.executed)
+        self.assertEqual(r.notice, "")
 
     def test_to_dict_serializable(self):
         f = Fact("x:1", "dead", "甲", True, chapter="ch_001")
@@ -225,6 +250,44 @@ class TestCheckResult(unittest.TestCase):
         self.assertEqual(len(CONFLICT_RULES), 5)
         ids = {r["id"] for r in CONFLICT_RULES}
         self.assertEqual(ids, {"R1", "R2", "R3", "R4", "R5"})
+
+
+class TestRuleR5Location(unittest.TestCase):
+    """R5 位置瞬移——启发式，只报 low。"""
+
+    def setUp(self):
+        self.facts = [Fact("s:1", "location", "张三", "涟城")]
+
+    def _r5(self, text):
+        r = check_text(text, self.facts)
+        return [i for i in r.issues if i.rule == "R5"]
+
+    def test_fires_on_different_place(self):
+        self.assertEqual(len(self._r5("张三此刻在青云山上。")), 1)
+
+    def test_fires_with_suffix_stripped(self):
+        # 「落雁关」是关卡，属于地名后缀
+        self.assertEqual(len(self._r5("张三这时身在落雁关。")), 1)
+
+    def test_silent_on_movement_verb(self):
+        # 有位移过程就不是瞬移
+        self.assertEqual(self._r5("张三来到青云山。"), [])
+
+    def test_silent_on_same_place(self):
+        self.assertEqual(self._r5("张三在涟城的街上走着。"), [])
+
+    def test_silent_on_non_place_words(self):
+        # 心里 / 手里 不是地点
+        self.assertEqual(self._r5("张三在心里盘算着。"), [])
+        self.assertEqual(self._r5("张三在手里攥着钥匙。"), [])
+
+    def test_severity_is_low(self):
+        hit = self._r5("张三此刻在青云山上。")
+        self.assertEqual(hit[0].severity, "low")
+
+    def test_no_location_fact_no_rule(self):
+        r = check_text("张三此刻在青云山上。", [Fact("s:1", "realm", "张三", "白牌")])
+        self.assertEqual([i for i in r.issues if i.rule == "R5"], [])
 
 
 if __name__ == "__main__":
