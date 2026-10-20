@@ -156,14 +156,58 @@ def op_remember(args: dict[str, Any]) -> dict[str, Any]:
 
     chest = mem.open(scope)
     try:
-        rec = chest.upsert(
-            layer or "style",
-            entity,
-            content,
-            data=args.get("data") if isinstance(args.get("data"), dict) else None,
-            chapter_id=args.get("chapter_id") or None,
-            keywords=keywords or None,
-        )
+        if layer == "foreshadowing":
+            # 伏笔不能走普通 upsert：
+            # set_foreshadow 会把 status / planted_chapter / planned_resolve
+            # 归一进 data，并保证未提供的字段沿用旧值。
+            # 走 upsert 的话这些字段散落在 data 里，patrol 读不到，巡检永远为空。
+            extra = args.get("data") if isinstance(args.get("data"), dict) else {}
+            status = str(extra.get("status") or "planted")
+
+            # 埋设章节：优先显式指定，其次库内最近章节。
+            # 两处都没有就留空——**不编造**章节号，否则陈旧判断会误报。
+            planted = (
+                args.get("chapter_id")
+                or extra.get("planted_chapter")
+                or None
+            )
+            if not planted:
+                try:
+                    recent = chest.recent_chapters(1)
+                    if recent:
+                        planted = recent[0].get("chapter_id") or None
+                except Exception:  # noqa: BLE001 - 章节表缺失不该阻断写入
+                    planted = None
+
+            fs = chest.set_foreshadow(
+                entity,
+                content,
+                status=status,
+                planted_chapter=planted,
+                planned_resolve=extra.get("planned_resolve") or None,
+                reinforced_chapters=extra.get("reinforced_chapters"),
+                resolved_chapter=extra.get("resolved_chapter") or None,
+                chapter_id=planted,
+                extra=extra,
+            )
+            rec_layer = "foreshadowing"
+            rec_version = fs.data.get("version") or 1
+            try:
+                got = chest.get("foreshadowing", entity)
+                rec_version = got.version if got else 1
+            except Exception:  # noqa: BLE001
+                pass
+        else:
+            rec = chest.upsert(
+                layer or "style",
+                entity,
+                content,
+                data=args.get("data") if isinstance(args.get("data"), dict) else None,
+                chapter_id=args.get("chapter_id") or None,
+                keywords=keywords or None,
+            )
+            rec_layer = rec.layer
+            rec_version = rec.version
         total = chest.stats()["total_records"]
     finally:
         _close(chest)
@@ -174,10 +218,10 @@ def op_remember(args: dict[str, Any]) -> dict[str, Any]:
             "work": mem.work_name,
             "path": mem.path_for(scope),
             "record": {
-                "layer": rec.layer,
-                "entity": rec.entity,
-                "version": rec.version,
-                "content": rec.content,
+                "layer": rec_layer,
+                "entity": entity,
+                "version": rec_version,
+                "content": content,
             },
             "total_in_scope": total,
         }
@@ -224,6 +268,10 @@ def op_recall(args: dict[str, Any]) -> dict[str, Any]:
             req = {"entities": entities, "query_context": str(args.get("query_context") or ""), "budget": b}
             if args.get("layers"):
                 req["layers"] = args["layers"]
+            # 按叙事位置检索：写第 N 章时只看这一章之前成立的设定
+            at_chapter = str(args.get("at_chapter") or "").strip()
+            if at_chapter:
+                req["at_chapter"] = at_chapter
             results[scope] = keeper.search(req)
         except SchemaError as exc:
             errors.append(f"{scope}: {exc}")
@@ -231,10 +279,17 @@ def op_recall(args: dict[str, Any]) -> dict[str, Any]:
             _close(chest)
 
     merged_tokens = sum(int(r.get("total_tokens") or 0) for r in results.values() if isinstance(r, dict))
+    # 各库里被显式标记为「已废止」的实体：正文不返回，但要把名字报出来，
+    # 否则用户会以为库中根本没有这条设定。
+    superseded: list[str] = []
+    for r in results.values():
+        if isinstance(r, dict):
+            superseded.extend(r.get("superseded") or [])
     return _ok(
         {
             "work": mem.work_name,
             "scopes": results,
+            "superseded": sorted(set(superseded)),
             "total_tokens": merged_tokens,
             "errors": errors,
         }
@@ -490,7 +545,7 @@ def op_overview(args: dict[str, Any]) -> dict[str, Any]:
                     rec = tchest.get("style", entity)
                     if rec is None:
                         # 技术条目可能落在任意层，逐个层找
-                        for layer in ("style", "world", "character", "item"):
+                        for layer in ("assertion", "style", "world", "character", "item"):
                             rec = tchest.get(layer, entity)
                             if rec is not None:
                                 break
@@ -513,7 +568,60 @@ def op_overview(args: dict[str, Any]) -> dict[str, Any]:
     info["work_block"] = work_block
     info["global_block"] = global_block
     info["tech_block"] = tech_block
+    # 面板开关的持久化状态：存在作品库 meta 里（没作品时退到全局库）。
+    # 它只控制面板是否展示内容，**不影响工具与已存数据**。
+    try:
+        info["enabled"] = _panel_enabled(mem)
+    except Exception:  # noqa: BLE001
+        info["enabled"] = True
     return _ok(info)
+
+
+def _panel_enabled(mem: Any) -> bool:
+    """读取面板显示开关（默认开）。"""
+    from .memory import SCOPE_GLOBAL, SCOPE_WORK
+
+    scope = SCOPE_WORK if mem.work_id else SCOPE_GLOBAL
+    path = mem.path_for(scope)
+    if not os.path.isfile(path):
+        return True
+    chest = mem.open(scope)
+    try:
+        return chest.get_meta("panel_enabled", "1") != "0"
+    finally:
+        _close(chest)
+
+
+def op_set_enabled(args: dict[str, Any]) -> dict[str, Any]:
+    """持久化面板显示开关。
+
+    注意：这只是「面板是否展示内容」的偏好，**不会停用工具，也不删数据**。
+    想真正停用整个插件，应该改配置 ``enabled: false``。
+    """
+    from .memory import SCOPE_GLOBAL, SCOPE_WORK
+
+    raw = args.get("enabled")
+    if isinstance(raw, str):
+        enabled = raw.strip().lower() not in ("0", "false", "no", "off")
+    else:
+        enabled = True if raw is None else bool(raw)
+
+    mem = _memory(args)
+    scope = SCOPE_WORK if mem.work_id else SCOPE_GLOBAL
+    chest = mem.open(scope)
+    try:
+        chest.set_meta("panel_enabled", "1" if enabled else "0")
+        saved = chest.get_meta("panel_enabled", "1") != "0"
+    finally:
+        _close(chest)
+
+    return _ok(
+        {
+            "enabled": saved,
+            "scope": scope,
+            "note": "只影响面板显示；工具与记忆数据不受影响",
+        }
+    )
 
 
 # --------------------------------------------------------------------------
@@ -772,12 +880,14 @@ def op_entries(args: dict[str, Any]) -> dict[str, Any]:
         chest = mem.open(scope)
     try:
         names = sorted(chest.all_entities([layer]))
+        usage_map = chest.usage_map()
         items: list[dict[str, Any]] = []
         for entity in names[:limit]:
             rec = chest.get(layer, entity)
             if rec is None:
                 continue
             full = str(rec.content or "")
+            u = usage_map.get((layer, rec.entity)) or {}
             items.append(
                 {
                     "layer": rec.layer,
@@ -790,6 +900,12 @@ def op_entries(args: dict[str, Any]) -> dict[str, Any]:
                     "last_updated": rec.last_updated,
                     "chapter_id": rec.chapter_id,
                     "data": rec.data,
+                    # 使用情况：被检索到过就算「已回收归档」，但内容永不删除
+                    "usage": {
+                        "hit_count": int(u.get("hit_count") or 0),
+                        "last_hit_at": u.get("last_hit_at"),
+                        "archived": bool(u.get("archived")),
+                    },
                 }
             )
         foreshadowings: list[dict[str, Any]] = []
@@ -838,13 +954,17 @@ def op_check(args: dict[str, Any]) -> dict[str, Any]:
 
     chest, meta = _open_scoped(args)
     if chest is None:
+        # 库不存在 = 没有事实 = 检查没执行。
+        # 注意：外层 ok 表示「调用是否成功」，这里调用是成功的；
+        # 「是否真的检查了」由 executed 表达，避免两个语义挤在一个字段里。
         return _ok(
             {
-                "ok": True,
+                "passed": False,
+                "executed": False,
                 "issues": [],
                 "facts_used": 0,
                 "rules_run": [],
-                "note": "作品库尚未建立，无可对照的设定",
+                "notice": "作品库尚未建立，没有可对照的设定事实，一致性检查无法执行",
                 "scope": meta,
                 "catalog": list(CONFLICT_RULES),
             }
@@ -856,9 +976,877 @@ def op_check(args: dict[str, Any]) -> dict[str, Any]:
         _close(chest)
 
     out = result.to_dict()
+    # CheckResult.to_dict() 自带 ok，会覆盖外层 ok —— 一旦查出冲突，
+    # 外层 ok 变成 False，调用方就会把它当成"调用失败"，看不到冲突详情。
+    # 所以这里剥掉 ok，改用 passed 表达「没发现问题」。
+    out.pop("ok", None)
+    out["passed"] = bool(result.ok)
     out["scope"] = meta
     out["catalog"] = list(CONFLICT_RULES)
     return _ok(out)
+
+
+def op_guard(args: dict[str, Any]) -> dict[str, Any]:
+    """技术护栏：拿一段代码/命令/配置，看命中了哪些断言。
+
+    参数：
+      text          要检查的代码或文本（可与 task 二选一）
+      task          要做的任务描述，用于匹配「流程性」断言
+                    （如 "回写 Assembly-CSharp 到 DLL"）
+      min_severity  可选，high|medium|low，默认 low（全部）
+      detailed      可选，是否输出修法与后果，默认 True
+
+    返回：
+      {hits[], total, rendered}
+      命中数就是要留意的条数；它不判断"代码有没有错"，
+      只提示"这里踩过坑"。
+    """
+    from .guard import guard as run_guard
+    from .guard import list_assertions, render
+
+    text = str(args.get("text") or "")
+    task = str(args.get("task") or "")
+    if not text.strip() and not task.strip():
+        return _err("text 或 task 至少给一个", code="bad_request")
+
+    min_sev = str(args.get("min_severity") or "low").strip()
+    detailed = args.get("detailed")
+    detailed = True if detailed is None else bool(detailed)
+
+    chest, meta = _open_scoped(args, layer="assertion")
+    if chest is None:
+        return _ok(
+            {
+                "hits": [],
+                "total": 0,
+                "rendered": "【技术护栏】技术库尚未建立，没有可用的断言",
+                "scope": meta,
+            }
+        )
+    try:
+        all_assertions = list_assertions(chest, min_severity=min_sev)
+        hits = run_guard(chest, text, task=task, min_severity=min_sev)
+        # 误报反馈：把历史上被判过"误报"的断言标出来，
+        # 提醒使用者「这条可能不准」，而不是当成硬规则照做。
+        fb = chest.feedback_stats("assertion")
+    finally:
+        _close(chest)
+
+    hit_dicts = []
+    for hh in hits:
+        d = hh.to_dict()
+        st = fb.get(f"assertion:{hh.assertion.id}") or {}
+        if st.get("total"):
+            d["fp"] = st.get("fp", 0)
+            d["tp"] = st.get("tp", 0)
+            d["fp_rate"] = st.get("fp_rate", 0.0)
+            d["unreliable"] = st.get("total", 0) >= 2 and st.get("fp_rate", 0) >= 0.5
+        hit_dicts.append(d)
+
+    rendered = render(hits, total=len(all_assertions), detailed=detailed)
+    bad = [d for d in hit_dicts if d.get("unreliable")]
+    if bad:
+        rendered += (
+            "\n\n⚠ 其中 "
+            + "、".join(d["id"] for d in bad)
+            + " 历史上多次被判为误报，命中仅供参考。"
+        )
+
+    return _ok(
+        {
+            "hits": hit_dicts,
+            "total": len(all_assertions),
+            "rendered": rendered,
+            "scope": meta,
+        }
+    )
+
+
+def op_assert(args: dict[str, Any]) -> dict[str, Any]:
+    """写入/更新一条技术断言。
+
+    参数：
+      id            必填，断言标识（短横线命名，如 unity-operator-eq-null）
+      rule          必填，一句话规则（祈使句）
+      detect_all    必填，匹配条件数组（至少 2 个，且不能太通用）
+      detect_not    可选，出现这些说明已正确，不报警
+      fix           可选，具体修法
+      consequence   可选，违反后果
+      severity      可选，high|medium|low
+      category      可选，性能/兼容/构建/反编译/数据/其他
+      cases         可选，关联的案例 ID
+
+    不合法会直接拒绝——会持续误报的断言比没有断言更糟。
+    """
+    from .guard import AssertionError_, save
+
+    aid = str(args.get("id") or "").strip()
+    rule = str(args.get("rule") or "").strip()
+    if not aid:
+        return _err("id 必填：断言标识", code="bad_request")
+    if not rule:
+        return _err("rule 必填：一句话规则", code="bad_request")
+
+    detect_all = args.get("detect_all") or []
+    if isinstance(detect_all, str):
+        detect_all = [detect_all]
+    detect_not = args.get("detect_not") or []
+    if isinstance(detect_not, str):
+        detect_not = [detect_not]
+    when = args.get("when") or []
+    if isinstance(when, str):
+        when = [when]
+
+    chest, meta = _open_scoped(args, layer="assertion")
+    if chest is None:
+        return _err("技术库不可用", code="not_found")
+    try:
+        a = save(
+            chest,
+            aid,
+            rule,
+            detect_all=detect_all,
+            detect_not=detect_not,
+            when=when,
+            fix=str(args.get("fix") or ""),
+            consequence=str(args.get("consequence") or ""),
+            severity=str(args.get("severity") or "medium"),
+            category=str(args.get("category") or "其他"),
+            cases=args.get("cases") or (),
+            allow_single=bool(args.get("allow_single")),
+        )
+    except AssertionError_ as exc:
+        return _err(f"断言被拒绝：{exc}", code="invalid_assertion")
+    finally:
+        _close(chest)
+
+    return _ok({"assertion": a.to_dict(), "scope": meta})
+
+
+def op_seed_assertions(args: dict[str, Any]) -> dict[str, Any]:
+    """把内置断言写入技术库（幂等）。
+
+    参数：overwrite（可选，true 时覆盖已存在的断言）
+
+    内置断言来自真实事故复盘，见 :mod:`enderwriter.assertions_seed`。
+    """
+    from .assertions_seed import BUILTIN_ASSERTIONS, seed_builtin
+
+    chest, meta = _open_scoped(args, layer="assertion")
+    if chest is None:
+        return _err("技术库不可用", code="not_found")
+    try:
+        result = seed_builtin(chest, overwrite=bool(args.get("overwrite")))
+        total = len(chest.all_entities(["assertion"]))
+    finally:
+        _close(chest)
+
+    return _ok(
+        {
+            **result,
+            "defined": len(BUILTIN_ASSERTIONS),
+            "total_in_library": total,
+            "scope": meta,
+        }
+    )
+
+
+def op_mark_superseded(args: dict[str, Any]) -> dict[str, Any]:
+    """把一条记录标记为「已废止」或取消该标记。
+
+    参数：
+      layer       图层
+      entity      实体名
+      superseded  可选，默认 True；传 false 取消标记
+      note        可选，废止说明（如「已被数值牌级制取代」）
+
+    废止后该记录**不再参与检索**（避免新旧口径同时出现），
+    但仍在库里可查、可恢复。
+    """
+    layer = str(args.get("layer") or "").strip()
+    entity = str(args.get("entity") or "").strip()
+    if not layer or not entity:
+        return _err("layer 与 entity 都必填", code="bad_request")
+
+    flag = args.get("superseded")
+    flag = True if flag is None else bool(flag)
+    note = str(args.get("note") or "").strip()
+
+    from .memory import SCOPE_TECH, route
+
+    scope = route(layer)
+    mem = _memory(args)
+    if scope not in (SCOPE_TECH, "global") and not mem.work_id:
+        return _err("作品库未指定", code="bad_request")
+
+    chest = mem.open(scope)
+    try:
+        rec = chest.get(layer, entity)
+        if rec is None:
+            return _ok({"changed": False, "reason": "not_found", "layer": layer, "entity": entity})
+        data = dict(rec.data or {})
+        if flag:
+            data["superseded"] = True
+            if note:
+                data["superseded_note"] = note
+        else:
+            data.pop("superseded", None)
+            data.pop("superseded_note", None)
+        chest.upsert(layer, entity, rec.content, data=data, chapter_id=rec.chapter_id)
+    finally:
+        _close(chest)
+
+    return _ok(
+        {
+            "changed": True,
+            "layer": layer,
+            "entity": entity,
+            "superseded": flag,
+            "note": note,
+        }
+    )
+
+
+def op_usage(args: dict[str, Any]) -> dict[str, Any]:
+    """使用概况：多少条已回收归档、多少条从未被检索过。
+
+    「归档」= 曾被检索进写作上下文。**不等于删除**——
+    末影箱在文学使用时兼当设定集，任何设定都要能随时查回来。
+
+    参数：
+      layer  可选，只看某一格
+      work   可选，作品名
+    """
+    chest, meta = _open_scoped(args, layer=str(args.get("layer") or "") or None)
+    if chest is None:
+        return _ok(
+            {
+                "summary": {"total": 0, "archived": 0, "used": 0, "unused": 0},
+                "unused": [],
+                "scope": meta,
+            }
+        )
+    try:
+        summary = chest.usage_summary()
+        usage = chest.usage_map()
+        layer_filter = str(args.get("layer") or "").strip()
+        unused: list[dict[str, Any]] = []
+        for layer in (["character", "world", "timeline", "foreshadowing", "item", "style", "assertion"]):
+            if layer_filter and layer != layer_filter:
+                continue
+            for entity in chest.all_entities([layer]):
+                if (layer, entity) in usage:
+                    continue
+                unused.append({"layer": layer, "entity": entity})
+    finally:
+        _close(chest)
+
+    return _ok({"summary": summary, "unused": unused[:200], "scope": meta})
+
+
+def op_archive(args: dict[str, Any]) -> dict[str, Any]:
+    """手动标记/取消一条记忆的「已回收归档」。
+
+    归档只影响面板归类，**不影响检索**，也不删除任何内容。
+
+    参数：layer、entity、archived（默认 true）、note
+    """
+    layer = str(args.get("layer") or "").strip()
+    entity = str(args.get("entity") or "").strip()
+    if not layer or not entity:
+        return _err("layer 与 entity 都必填", code="bad_request")
+
+    flag = args.get("archived")
+    flag = True if flag is None else bool(flag)
+
+    chest, meta = _open_scoped(args, layer=layer)
+    if chest is None:
+        return _err("库不存在", code="not_found")
+    try:
+        rec = chest.get(layer, entity)
+        if rec is None:
+            return _ok({"changed": False, "reason": "not_found", "layer": layer, "entity": entity})
+        ok = chest.set_archived(layer, entity, flag, note=str(args.get("note") or ""))
+        usage = chest.usage_of(layer, entity) or {}
+    finally:
+        _close(chest)
+
+    return _ok(
+        {
+            "changed": bool(ok),
+            "layer": layer,
+            "entity": entity,
+            "archived": flag,
+            "usage": usage,
+            "scope": meta,
+        }
+    )
+
+
+def op_history(args: dict[str, Any]) -> dict[str, Any]:
+    """列出某条记忆的所有历史版本。
+
+    每次覆写都会追加一个版本，旧内容永不丢失——
+    这样 AI 可以放心地覆写设定，人随时能回看改了什么。
+
+    参数：layer、entity、work（可选）
+    """
+    layer = str(args.get("layer") or "").strip()
+    entity = str(args.get("entity") or "").strip()
+    if not layer or not entity:
+        return _err("layer 与 entity 都必填", code="bad_request")
+
+    chest, meta = _open_scoped(args, layer=layer)
+    if chest is None:
+        return _err("库不存在", code="not_found")
+    try:
+        rec = chest.get(layer, entity)
+        resolved = rec.entity if rec else entity
+        rows = chest.conn.execute(
+            "SELECT version, content, chapter_id, updated_at, change "
+            "FROM history WHERE layer=? AND entity=? ORDER BY version DESC",
+            (layer, resolved),
+        ).fetchall()
+        current = int(rec.version) if rec else 0
+    finally:
+        _close(chest)
+
+    versions = [
+        {
+            "version": int(r["version"]),
+            "chars": len(str(r["content"] or "")),
+            "content": str(r["content"] or ""),
+            "chapter_id": r["chapter_id"],
+            "updated_at": r["updated_at"],
+            "change": r["change"] or "",
+            "current": int(r["version"]) == current,
+        }
+        for r in rows
+    ]
+    return _ok(
+        {
+            "layer": layer,
+            "entity": resolved,
+            "current_version": current,
+            "count": len(versions),
+            "versions": versions,
+            "scope": meta,
+        }
+    )
+
+
+def op_revert(args: dict[str, Any]) -> dict[str, Any]:
+    """把某条记忆回滚到指定历史版本。
+
+    实现方式：把旧内容**作为新版本写回**（version + 1），
+    而不是删掉后面的版本。所以「回滚」本身也可再回滚，
+    完整历史链始终保留——这符合「文字本身不改」的约束。
+
+    参数：layer、entity、version（目标版本号）、work（可选）
+    """
+    layer = str(args.get("layer") or "").strip()
+    entity = str(args.get("entity") or "").strip()
+    if not layer or not entity:
+        return _err("layer 与 entity 都必填", code="bad_request")
+    try:
+        want = int(args.get("version"))
+    except (TypeError, ValueError):
+        return _err("version 必填，且必须是整数", code="bad_request")
+
+    chest, meta = _open_scoped(args, layer=layer)
+    if chest is None:
+        return _err("库不存在", code="not_found")
+    try:
+        rec = chest.get(layer, entity)
+        if rec is None:
+            return _err(f"没有这条记忆：{entity}", code="not_found")
+        row = chest.conn.execute(
+            "SELECT content, data, chapter_id FROM history WHERE layer=? AND entity=? AND version=?",
+            (layer, rec.entity, want),
+        ).fetchone()
+        if row is None:
+            return _err(f"没有 v{want} 这个版本", code="bad_request")
+
+        from .common import loads as _loads
+
+        data = _loads(row["data"], {}) or {}
+        new_rec = chest.upsert(
+            layer,
+            rec.entity,
+            str(row["content"] or ""),
+            data=data,
+            chapter_id=row["chapter_id"],
+            change=f"revert to v{want}",
+        )
+        new_version = int(new_rec.version)
+    finally:
+        _close(chest)
+
+    return _ok(
+        {
+            "layer": layer,
+            "entity": rec.entity,
+            "reverted_to": want,
+            "new_version": new_version,
+            "note": f"已把 v{want} 的内容写回为 v{new_version}（旧版本全部保留）",
+            "scope": meta,
+        }
+    )
+
+
+def op_build_edges(args: dict[str, Any]) -> dict[str, Any]:
+    """从正文自动抽取实体关系（edges）。
+
+    只写**强边**：被提到 ≥min_weight 次，或出现在正文开头（主题级）。
+    弱边一律丢弃——多跳检索会被噪声稀释，比不建边更差。
+
+    参数：
+      min_weight     可选，默认 2
+      max_per_src    可选，每个实体最多保留多少条出边，默认 12
+      work           可选，作品名
+    """
+    from .relations import build_edges, extract_candidates, render
+
+    chest, meta = _open_scoped(args)
+    if chest is None:
+        return _err("作品库尚未建立", code="not_found")
+    try:
+        candidates = extract_candidates(chest)
+        stats = build_edges(
+            chest,
+            min_weight=int(args.get("min_weight") or 2),
+            max_per_src=int(args.get("max_per_src") or 12),
+        )
+    finally:
+        _close(chest)
+
+    return _ok(
+        {
+            **stats,
+            "rendered": render(stats, sample=[c for c in candidates if c.weight >= 2][:8]),
+            "sample": [c.to_dict() for c in candidates[:20]],
+            "scope": meta,
+        }
+    )
+
+
+def op_edges(args: dict[str, Any]) -> dict[str, Any]:
+    """查看某条记忆的关系（出边 / 入边）。"""
+    from .relations import REL_CN, edge_stats
+
+    entity = str(args.get("entity") or "").strip()
+
+    chest, meta = _open_scoped(args)
+    if chest is None:
+        return _ok({"stats": {"total": 0, "by_rel": {}}, "out": [], "in": [], "scope": meta})
+    try:
+        stats = edge_stats(chest)
+        out_edges: list[dict[str, Any]] = []
+        in_edges: list[dict[str, Any]] = []
+        if entity:
+            from .common import loads as _loads
+
+            rows = chest.conn.execute(
+                "SELECT * FROM edges WHERE src=? OR dst=?", (entity, entity)
+            ).fetchall()
+            for r in rows:
+                d = _loads(r["data"], {}) or {}
+                item = {
+                    "src": r["src"],
+                    "rel": r["rel"],
+                    "rel_cn": REL_CN.get(str(r["rel"]), str(r["rel"])),
+                    "dst": r["dst"],
+                    "weight": d.get("weight"),
+                }
+                (out_edges if r["src"] == entity else in_edges).append(item)
+            out_edges.sort(key=lambda x: -(x.get("weight") or 0))
+            in_edges.sort(key=lambda x: -(x.get("weight") or 0))
+    finally:
+        _close(chest)
+
+    return _ok(
+        {
+            "stats": stats,
+            "entity": entity,
+            "out": out_edges,
+            "in": in_edges,
+            "scope": meta,
+        }
+    )
+
+
+def op_organize(args: dict[str, Any]) -> dict[str, Any]:
+    """整理分析：指出重复候选、孤立条目、已废止、从未使用。
+
+    **不改任何内容。** 合并必须由人确认；即便合并也走版本号，
+    旧版全部保留可回看。
+
+    参数：work（可选）
+    """
+    from .export import organize, render_organize
+
+    chest, meta = _open_scoped(args)
+    if chest is None:
+        return _err("作品库尚未建立", code="not_found")
+    try:
+        rep = organize(chest)
+    finally:
+        _close(chest)
+
+    return _ok({**rep, "rendered": render_organize(rep), "scope": meta})
+
+
+def op_export(args: dict[str, Any]) -> dict[str, Any]:
+    """导出为结构化 Markdown 设定集。
+
+    组织方式：按图层分卷，卷内按 ``part_of`` 关系做两级嵌套；
+    原文一字不改，已废止的条目保留并加标记。
+
+    参数：
+      title               可选，文档标题
+      include_superseded  可选，是否收录已废止条目，默认 true
+      include_history     可选，是否附历史版本，默认 false
+      include_relations   可选，是否附关联，默认 true
+      include_unused      可选，是否附「尚未被引用」，默认 true
+      save                可选，写到这个路径（不给则只返回文本）
+    """
+    from .export import export_markdown
+
+    chest, meta = _open_scoped(args)
+    if chest is None:
+        return _err("作品库尚未建立", code="not_found")
+    try:
+        md = export_markdown(
+            chest,
+            title=str(args.get("title") or "设定集"),
+            include_superseded=args.get("include_superseded") is not False,
+            include_history=bool(args.get("include_history")),
+            include_relations=args.get("include_relations") is not False,
+            include_unused=args.get("include_unused") is not False,
+        )
+    finally:
+        _close(chest)
+
+    saved = ""
+    path = str(args.get("save") or "").strip()
+    if path:
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+            with open(path, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(md)
+            saved = os.path.abspath(path)
+        except OSError as exc:
+            return _err(f"写入失败：{exc}", code="io_error")
+
+    return _ok(
+        {
+            "markdown": md,
+            "chars": len(md),
+            "saved": saved,
+            "scope": meta,
+        }
+    )
+
+
+def op_chapter(args: dict[str, Any]) -> dict[str, Any]:
+    """记录一章正文，并把它设为「当前章节」。
+
+    这是让末影箱知道「你写到哪了」的入口。记下来之后：
+
+      * ``recall`` 传 ``at_chapter`` 就只看这一章之前成立的设定
+      * 伏笔巡检能算出超期
+      * 写回能挂到具体章节上
+
+    参数：
+      chapter_id  必填，如 ch_042
+      text        可选，正文
+      title       可选，章节标题
+      summary     可选，本章摘要
+      work        作品名
+    """
+    from .common import chapter_index
+
+    cid = str(args.get("chapter_id") or "").strip()
+    if not cid:
+        return _err("chapter_id 必填，如 ch_042", code="bad_request")
+    if chapter_index(cid) < 0:
+        return _err(f"无法解析章节号：{cid!r}（应形如 ch_042）", code="bad_request")
+
+    # 记录章节通常是这个作品库的第一个动作（还没写过任何设定），
+    # 所以这里不能用 _open_scoped —— 它在库不存在时会拒绝打开。
+    mem = _memory(args)
+    if not mem.work_id:
+        return _err("需要指定 work 或 session_id", code="bad_request")
+    chest = mem.open("work")
+    try:
+        chest.put_chapter(
+            cid,
+            str(args.get("text") or ""),
+            title=str(args.get("title") or ""),
+            summary=str(args.get("summary") or ""),
+            commit=False,
+        )
+        # 只在章节号更大时推进"当前章节"，避免回看旧章把进度退回去
+        prev = chest.current_chapter
+        advanced = False
+        if not prev or chapter_index(cid) >= chapter_index(prev):
+            chest.set_meta("current_chapter", cid, commit=False)
+            advanced = True
+        chest.conn.commit()
+        total = len(list(chest.iter_chapters()))
+        cur = chest.current_chapter
+    finally:
+        _close(chest)
+
+    return _ok(
+        {
+            "chapter_id": cid,
+            "current_chapter": cur,
+            "advanced": advanced,
+            "chapters_total": total,
+            "scope": {
+                "mode": "scoped",
+                "scope": "work",
+                "path": mem.work_path,
+                "work": mem.work_name,
+                "exists": True,
+            },
+        }
+    )
+
+
+def op_timeline(args: dict[str, Any]) -> dict[str, Any]:
+    """给一条记忆标注生效章节（``valid_from`` / ``valid_until``）。
+
+    长篇里同一条设定会随剧情变化：
+      「白杨不会变身」在第 1 章成立，第 50 章之后就不是了。
+    标注了区间，检索时按 ``at_chapter`` 就能拿到**当时正确**的版本。
+
+    参数：layer、entity、valid_from、valid_until（都可留空表示不限）
+    """
+    layer = str(args.get("layer") or "").strip()
+    entity = str(args.get("entity") or "").strip()
+    if not layer or not entity:
+        return _err("layer 与 entity 都必填", code="bad_request")
+
+    chest, meta = _open_scoped(args, layer=layer)
+    if chest is None:
+        return _err("库不存在", code="not_found")
+    try:
+        rec = chest.get(layer, entity)
+        if rec is None:
+            return _err(f"没有这条记忆：{entity}", code="not_found")
+        data = dict(rec.data or {})
+        for key, arg in (("valid_from", "valid_from"), ("valid_until", "valid_until")):
+            val = str(args.get(arg) or "").strip()
+            if val:
+                data[key] = val
+            else:
+                data.pop(key, None)
+        chest.upsert(layer, rec.entity, rec.content, data=data, chapter_id=rec.chapter_id)
+        version = 0
+        got = chest.get(layer, rec.entity)
+        version = got.version if got else 0
+    finally:
+        _close(chest)
+
+    return _ok(
+        {
+            "layer": layer,
+            "entity": entity,
+            "valid_from": data.get("valid_from"),
+            "valid_until": data.get("valid_until"),
+            "version": version,
+            "scope": meta,
+        }
+    )
+
+
+def op_feedback(args: dict[str, Any]) -> dict[str, Any]:
+    """记录一次命中判定的对错，用于让规则/断言变准。
+
+    参数：
+      kind     assertion（技术断言）| rule（R1..R5 一致性规则）
+      ref      断言 id 或规则 id
+      verdict  fp=误报，tp=确实有问题
+      note     可选，说明为什么算误报
+
+    反馈会累积成误报率：fp_rate 高的断言在输出里会被标出来，
+    提醒「这条可能不准，别当硬规则用」。
+    """
+    kind = str(args.get("kind") or "").strip()
+    ref = str(args.get("ref") or "").strip()
+    verdict = str(args.get("verdict") or "").strip().lower()
+    if kind not in ("assertion", "rule"):
+        return _err("kind 只能是 assertion / rule", code="bad_request")
+    if not ref:
+        return _err("ref 必填：断言 id 或规则 id", code="bad_request")
+    if verdict not in ("fp", "tp"):
+        return _err("verdict 只能是 fp（误报）/ tp（真问题）", code="bad_request")
+
+    # assertion 在技术库，rule 与作品无关，统一用技术库承载反馈
+    from .memory import SCOPE_TECH
+
+    mem = _memory(args)
+    chest = mem.open(SCOPE_TECH)
+    try:
+        chest.add_feedback(kind, ref, verdict, note=str(args.get("note") or ""))
+        stats = chest.feedback_stats(kind, ref)
+    finally:
+        _close(chest)
+
+    key = f"{kind}:{ref}"
+    return _ok({"recorded": True, "kind": kind, "ref": ref, "verdict": verdict, "stats": stats.get(key, {})})
+
+
+def op_feedback_stats(args: dict[str, Any]) -> dict[str, Any]:
+    """查看所有规则/断言的误报率。"""
+    from .memory import SCOPE_TECH
+
+    mem = _memory(args)
+    chest = mem.open(SCOPE_TECH)
+    try:
+        stats = chest.feedback_stats(
+            str(args.get("kind") or ""), str(args.get("ref") or "")
+        )
+    finally:
+        _close(chest)
+
+    flagged = {k: v for k, v in stats.items() if v.get("fp_rate", 0) >= 0.5 and v.get("total", 0) >= 2}
+    return _ok({"stats": stats, "unreliable": flagged, "count": len(stats)})
+
+
+def op_update(args: dict[str, Any]) -> dict[str, Any]:
+    """直接修改一条记忆的正文（生成新版本，旧版全部保留）。
+
+    与 ``remember`` 的区别：这个接口用于「编辑已有条目」，
+    会保留原有 data（如 valid_from / superseded 等标记）。
+
+    参数：layer、entity、content（新正文）、note（可选，版本说明）
+    """
+    layer = str(args.get("layer") or "").strip()
+    entity = str(args.get("entity") or "").strip()
+    content = args.get("content")
+    if not layer or not entity:
+        return _err("layer 与 entity 都必填", code="bad_request")
+    if content is None:
+        return _err("content 必填", code="bad_request")
+    content = str(content)
+
+    chest, meta = _open_scoped(args, layer=layer)
+    if chest is None:
+        return _err("库不存在", code="not_found")
+    try:
+        rec = chest.get(layer, entity)
+        if rec is None:
+            return _err(f"没有这条记忆：{entity}", code="not_found")
+        note = str(args.get("note") or "edit")
+        new_rec = chest.upsert(
+            layer,
+            rec.entity,
+            content,
+            data=dict(rec.data or {}),
+            chapter_id=rec.chapter_id,
+            change=note,
+        )
+        version = int(new_rec.version)
+    finally:
+        _close(chest)
+
+    return _ok(
+        {
+            "layer": layer,
+            "entity": entity,
+            "version": version,
+            "chars": len(content),
+            "note": "已保存为新版本，旧版本可在历史里回看/回滚",
+            "scope": meta,
+        }
+    )
+
+
+def op_import(args: dict[str, Any]) -> dict[str, Any]:
+    """从既有文档导入设定（反向建库）。
+
+    **默认只预演**（``dry_run=true``），返回完整清单供人确认；
+    必须显式传 ``dry_run=false`` 才真正写入。
+
+    参数：
+      path        必填，文档路径（.txt / .md）
+      dry_run     可选，默认 true
+      layer       可选，兜底图层，默认 world
+      skip        可选，标题包含这些子串的分节跳过
+      overrides   可选，{标题子串: 图层} 强制指定
+      chapter_id  可选，导入的条目挂到哪一章
+    """
+    from .importer import plan_import, render_plan, run_import
+
+    path = str(args.get("path") or "").strip()
+    if not path:
+        return _err("path 必填：文档路径", code="bad_request")
+    if not os.path.isfile(path):
+        return _err(f"文件不存在：{path}", code="not_found")
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            text = fh.read()
+    except OSError as exc:
+        return _err(f"读取失败：{exc}", code="io_error")
+
+    skip = args.get("skip") or []
+    if isinstance(skip, str):
+        skip = [s.strip() for s in skip.replace("，", ",").split(",") if s.strip()]
+    overrides = args.get("overrides") if isinstance(args.get("overrides"), dict) else {}
+
+    plan = plan_import(
+        text,
+        default_layer=str(args.get("layer") or "world"),
+        overrides=overrides,
+        skip=skip,
+    )
+    rendered = render_plan(plan)
+
+    dry = args.get("dry_run")
+    dry = True if dry is None else bool(dry)
+    if dry:
+        return _ok(
+            {
+                "dry_run": True,
+                "sections": plan["sections"],
+                "to_import": plan["to_import"],
+                "by_layer": plan["by_layer"],
+                "items": [
+                    {"entity": i["entity"], "layer": i["layer"], "chars": i["chars"]}
+                    for i in plan["items"]
+                ],
+                "skipped": plan["skipped"],
+                "rendered": rendered,
+            }
+        )
+
+    mem = _memory(args)
+    if not mem.work_id:
+        return _err("需要指定 work 或 session_id", code="bad_request")
+    chest = mem.open("work")
+    try:
+        result = run_import(
+            chest,
+            plan,
+            chapter_id=str(args.get("chapter_id") or "") or None,
+            keyword=os.path.basename(path),
+        )
+        total = chest.stats()["total_records"]
+    finally:
+        _close(chest)
+
+    return _ok(
+        {
+            "dry_run": False,
+            "imported": len(result["written"]),
+            "failed": result["failed"],
+            "total_in_scope": total,
+            "rendered": f"【导入完成】写入 {len(result['written'])} 条，库内共 {total} 条。\n\n" + rendered,
+        }
+    )
 
 
 _OPS = {
@@ -879,6 +1867,36 @@ _OPS = {
     "forgetEntry": op_forget_entry,
     # 一致性检查
     "check": op_check,
+    # 技术护栏
+    "guard": op_guard,
+    "assert": op_assert,
+    "seedAssertions": op_seed_assertions,
+    # 设定集：废止标记
+    "markSuperseded": op_mark_superseded,
+    # 使用记录：回收归档（只标记，不删除）
+    "usage": op_usage,
+    "archive": op_archive,
+    # 版本：AI 可覆写，人可回看/回滚
+    "history": op_history,
+    "revert": op_revert,
+    # 关系：自动抽取强边
+    "buildEdges": op_build_edges,
+    "edges": op_edges,
+    # 整理与导出
+    "organize": op_organize,
+    "export": op_export,
+    # 时间轴：记录章节 + 设定生效区间
+    "chapter": op_chapter,
+    "timeline": op_timeline,
+    # 反馈：让规则/断言变准
+    "feedback": op_feedback,
+    "feedbackStats": op_feedback_stats,
+    # 编辑：改已有条目（生成新版本）
+    "update": op_update,
+    # 导入：从既有文档反向建库
+    "import": op_import,
+    # 面板开关
+    "setEnabled": op_set_enabled,
 }
 
 
